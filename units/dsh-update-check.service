@@ -1,0 +1,19 @@
+[Unit]
+Description=DSH update check (desktop notification)
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+# The session bus is what makes a notification deliverable. It is discovered at
+# runtime rather than assumed, so this works on any desktop environment (GNOME,
+# KDE, XFCE, MATE, Cinnamon, ...) and simply skips notifying where none exists.
+Wants=network-online.target
+After=network-online.target default.target
+PartOf=default.target
+
+[Service]
+Type=oneshot
+# XDG_RUNTIME_DIR locates the user's runtime directory; the bus address is
+# derived from it in the script, with a fallback to the conventional path.
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=__PYTHON__ %h/.local/bin/dsh-update.py notify
+# `notify` already returns 0 on network/GitHub errors (see cmd_notify).
+# SuccessExitStatus is not used here: 0 already means success and a genuine
+# crash must not be hidden.

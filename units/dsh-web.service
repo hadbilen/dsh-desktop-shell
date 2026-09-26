@@ -1,0 +1,23 @@
+[Unit]
+Description=DeepSeek Harness Web Service
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+# network.target only means "the stack is configured", not "the network is
+# usable". DSH makes DNS/HTTP calls at startup, so the real online target is
+# required.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# The interpreter and entry script are written at install time by install.sh;
+# no hardcoded user name or third-party application path.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=__NODE__ __DSH_BIN__ web --no-open
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

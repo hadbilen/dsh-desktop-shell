@@ -1,0 +1,24 @@
+[Unit]
+Description=DeepSeek Harness remote-access proxy
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+# The proxy talks to DSH Web, so it must start after it.
+Wants=network-online.target dsh-web.service
+After=network-online.target dsh-web.service
+PartOf=dsh-web.service
+
+[Service]
+Type=simple
+# Remote access is enabled ONLY when DSH_PROXY_TOKEN is set. Without a token
+# the proxy binds to loopback and serves nothing externally (the safe default).
+# To generate a token: head -c 32 /dev/urandom | base64
+EnvironmentFile=-%h/.config/dsh/proxy.env
+# To bind to the Tailscale interface: DSH_PROXY_BIND=<tailscale ip -4>
+Environment=DSH_PROXY_BIND=127.0.0.1
+Environment=DSH_PROXY_PORT=3000
+Environment=DSH_WEB_URL=http://127.0.0.1:3080
+ExecStart=__NODE__ %h/.local/bin/dsh-tailscale-proxy.mjs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

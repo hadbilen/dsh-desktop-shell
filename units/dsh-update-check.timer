@@ -1,0 +1,25 @@
+[Unit]
+Description=Run the DSH update check periodically (twice daily + at boot)
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+# WantedBy=graphical-session.target would be more precise, but that target is
+# not guaranteed to exist outside GNOME/KDE (XFCE, MATE, Cinnamon and plain
+# window-manager sessions may not pull it in), which would leave the timer
+# permanently inactive. timers.target exists everywhere, so it is used for the
+# dependency and the service itself checks whether a notification daemon is
+# actually reachable before trying to notify.
+After=default.target
+PartOf=default.target
+
+[Timer]
+# Once, 10 minutes after boot
+OnBootSec=10min
+# Every day at 10:00 and 22:00
+OnCalendar=*-*-* 10,22:00
+# Catch up a run missed while the machine was off
+Persistent=true
+# Random delay so the server is not hit simultaneously
+RandomizedDelaySec=15min
+Unit=dsh-update-check.service
+
+[Install]
+WantedBy=timers.target

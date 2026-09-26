@@ -1,0 +1,8 @@
+node_modules/
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+tree-backup/
+HANDOFF.md
+tasks.md

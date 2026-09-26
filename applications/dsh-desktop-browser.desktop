@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DSH Desktop (browser window)
+Comment=Fallback: open DeepSeek Harness in a plain browser app window (no tray)
+Comment[tr]=Yedek: DSH'yi duz tarayici penceresinde ac (tepsi destegi yok)
+Exec=@BIN_DIR@/dsh-app-window.sh
+TryExec=@BIN_DIR@/dsh-app-window.sh
+Icon=@ICON_DIR@/dsh-desktop.png
+Terminal=false
+StartupNotify=true
+StartupWMClass=DSH-Desktop
+Categories=Development;
+Keywords=deepseek;harness;dsh;ai;agent;browser;

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DSH Desktop
+GenericName=AI Coding Agent
+Comment=Tray-capable desktop shell for DeepSeek Harness (X hides to tray)
+Comment[tr]=DeepSeek Harness icin tepsi destekli masaustu kabugu (X = tepsiye gizle)
+Exec=@BIN_DIR@/dsh-desktop-launch.sh
+TryExec=@BIN_DIR@/dsh-desktop-launch.sh
+Icon=@ICON_DIR@/dsh-desktop.png
+Terminal=false
+StartupNotify=true
+StartupWMClass=DSH-Desktop
+Categories=Development;
+Keywords=deepseek;harness;dsh;ai;agent;tray;

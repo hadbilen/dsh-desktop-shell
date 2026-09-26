@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# dsh-update wrapper: runs the script with a discoverable python3.
+#
+# The interpreter is resolved from PATH (rather than a hardcoded
+# /usr/bin/python3) so virtual environments and other distributions work. The
+# script path is derived from this wrapper's own location; no hardcoded user
+# name.
+
+set -euo pipefail
+
+BIN_DIR="${DSH_BIN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+SCRIPT="$BIN_DIR/dsh-update.py"
+PY="${DSH_PYTHON:-$(command -v python3 || true)}"
+
+if [ -z "$PY" ]; then
+  echo "dsh-update: python3 not found." >&2
+  exit 1
+fi
+if [ ! -f "$SCRIPT" ]; then
+  echo "dsh-update: script not found: $SCRIPT" >&2
+  exit 1
+fi
+
+exec "$PY" "$SCRIPT" "$@"
