@@ -81,8 +81,8 @@ for f in dsh-desktop.desktop dsh-desktop-browser.desktop \
 done
 
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
-if [ -L "$DESKTOP_DIR/dsh-desktop.desktop" ]; then
-  run rm -f "$DESKTOP_DIR/dsh-desktop.desktop"
+if [ -L "$DESKTOP_DIR/dsh-desktop.desktop" ] || [ -f "$DESKTOP_DIR/dsh-desktop.desktop" ]; then
+  run rm -f "$DESKTOP_DIR/dsh-desktop.desktop" 2>/dev/null || true
   say "shortcut removed"
 fi
 
@@ -151,11 +151,11 @@ fi
 
 if [ "$PURGE" = 1 ]; then
   step "Extra cleanup (--purge)"
-  run rm -rf "$PROFILE_DIR"/cordis.patch.yml.bak.*
-  run rm -rf "$HOME/.cache/dsh-update"
-  run rm -rf "$DATA_DIR/dsh-tray"
-  run rm -rf "$DATA_DIR/dsh-app"
-  run rm -f "$CONF_DIR/dsh/proxy.env"
+  run rm -rf "$PROFILE_DIR"/cordis.patch.yml.bak.* 2>/dev/null || true
+  run rm -rf "$HOME/.cache/dsh-update" 2>/dev/null || true
+  run rm -rf "$DATA_DIR/dsh-tray" 2>/dev/null || true
+  run rm -rf "$DATA_DIR/dsh-app" 2>/dev/null || true
+  run rm -f "$CONF_DIR/dsh/proxy.env" 2>/dev/null || true
   [ -d "$CONF_DIR/dsh" ] && rmdir "$CONF_DIR/dsh" 2>/dev/null || true
   say "local state, proxy configuration, and backups removed"
   say "(versions, sessions and the profile were preserved)"

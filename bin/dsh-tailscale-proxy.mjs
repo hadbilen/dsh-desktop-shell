@@ -313,7 +313,7 @@ const server = http.createServer((req, res) => {
           total += chunk.length;
           if (total > MAX_BUFFER) {
             aborted = true;
-            proxyRes.removeListener('data', onData);
+            proxyRes.removeAllListeners('data');
             const responseHeaders = { ...proxyRes.headers };
             if (setCookie) attachSetCookie(responseHeaders, PROXY_TOKEN);
             res.writeHead(proxyRes.statusCode, responseHeaders);

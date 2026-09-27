@@ -407,8 +407,8 @@ try:
     stack = []
 
     for idx, line in enumerate(lines, 1):
-        indent = len(line) - len(line.lstrip(" "))
-        if "\t" in line[:indent]:
+        leading_ws = line[:len(line) - len(line.lstrip())]
+        if "\t" in leading_ws:
             sys.exit(1)
 
         trimmed = line.strip()
@@ -427,6 +427,8 @@ try:
             elif ch == '"' and not in_single:
                 in_double = not in_double
             elif not in_single and not in_double:
+                if ch == "#":
+                    break
                 if ch in "([{":
                     stack.append(ch)
                 elif ch in ")]}":
@@ -435,6 +437,7 @@ try:
                     top = stack.pop()
                     if (top == "(" and ch != ")") or (top == "[" and ch != "]") or (top == "{" and ch != "}"):
                         sys.exit(1)
+        escape = False
 
     if in_single or in_double or stack:
         sys.exit(1)
@@ -462,6 +465,8 @@ PY
         else
           say "! plugin does not import; removing it from the profile"
           remove_plugin_from_manifest
+          LATEST_BAK="$(ls -t "$PATCH".bak.* 2>/dev/null | head -n1)"
+          [ -n "$LATEST_BAK" ] && cp "$LATEST_BAK" "$PATCH"
           say "  Profile restored. Check: cd $PLUGIN_DIR && pnpm install"
         fi
       fi

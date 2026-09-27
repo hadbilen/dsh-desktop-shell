@@ -644,7 +644,7 @@ class DshWindow(QMainWindow):
     <div><strong>Log:</strong> journalctl --user -u dsh-web.service -n 50</div>
     <div><strong>Start:</strong> systemctl --user start dsh-web.service</div>
   </div>
-  <p><button onclick="location.reload()" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;">Retry Connection</button></p>
+  <p><button onclick="window.location.href = '{URL}'" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;">Retry Connection</button></p>
 </body>
 </html>"""
             self.view.setHtml(error_html, QUrl(URL))
