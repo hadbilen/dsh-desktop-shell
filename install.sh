@@ -55,11 +55,26 @@ step "Prerequisites"
 
 NODE=""
 for cand in "${DSH_NODE:-}" "$(command -v node || true)" \
-            "$HOME/.bun/bin/node" /usr/local/bin/node /usr/bin/node; do
-  [ -n "$cand" ] && [ -x "$cand" ] && { NODE="$cand"; break; }
+            /usr/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
+  if [ -n "$cand" ] && [ -x "$cand" ]; then
+    # Verify that the binary is a real Node.js with V8 engine (not Bun masquerading as node)
+    if "$cand" -e 'process.exit(process.versions.v8 ? 0 : 1)' >/dev/null 2>&1; then
+      NODE="$cand"
+      break
+    fi
+  fi
 done
+
 if [ -z "$NODE" ]; then
-  echo "ERROR: node not found. Set DSH_NODE to its absolute path." >&2
+  RAW_NODE="$(command -v node || true)"
+  if [ -n "$RAW_NODE" ]; then
+    echo "ERROR: $RAW_NODE was found, but it is not a standard Node.js runtime with V8 (e.g. Bun or wrapper)." >&2
+    echo "       DeepSeek Harness native modules require standard Node.js (v20+ with V8 engine)." >&2
+    echo "       Install Node.js: sudo apt install nodejs (or via nvm / fnm) or set DSH_NODE=/path/to/node." >&2
+  else
+    echo "ERROR: Node.js with V8 engine not found. Set DSH_NODE to its absolute path." >&2
+    echo "       Install Node.js: sudo apt install nodejs (or via nvm / fnm)." >&2
+  fi
   exit 1
 fi
 say "node        : $NODE"

@@ -10,6 +10,7 @@
 #
 # Configurable:
 #   DSH_TRAY_WINDOW   maximized (default) | fullscreen | normal
+#   DSH_NEW_CHAT      1 (default: start with new chat) | 0 (restore last chat)
 #   DSH_BIN_DIR       directory holding the scripts (default ~/.local/bin)
 #   DSH_PYTHON        python3 interpreter to use
 

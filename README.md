@@ -51,7 +51,7 @@ Settings live in the DSH settings document under the `notify` namespace:
 ## Requirements
 
 - Linux with a systemd **user** session
-- `node` (v22.19+ or v24+) and a DSH install (`@deepseek-ai/dsh`)
+- `node` (standard Node.js v20+ with V8 engine; note that Bun masquerading as node is not supported by DSH native modules) and a DSH install (`@deepseek-ai/dsh`)
 - `python3` 3.10+
 - **Optional but recommended:** `python3-pyqt6.qtwebengine` for the tray shell.
   Without it the launcher falls back to a plain browser app window.
@@ -194,6 +194,7 @@ All scripts read environment variables; nothing hardcodes a username.
 |---|---|---|
 | `DSH_WEB_URL` | tray, browser window, proxy | `http://127.0.0.1:3080` |
 | `DSH_TRAY_WINDOW` | tray launcher | `maximized` (`fullscreen`/`normal`) |
+| `DSH_NEW_CHAT` | tray launcher | `1` (clean new chat) / `0` (restore last) |
 | `DSH_CHROME` | browser window fallback | auto-detected (Chrome, Chromium, Brave, Edge) |
 | `DSH_NODE` | launcher, installer | auto-detected |
 | `DSH_BIN` | launcher, installer | auto-detected |

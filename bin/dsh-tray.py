@@ -73,6 +73,10 @@ if WINDOW_MODE not in ("maximized", "fullscreen", "normal"):
           "using 'maximized'.", file=sys.stderr)
     WINDOW_MODE = "maximized"
 
+# Startup session mode: 1 / "true" starts with a clean new session; 0 / "false" restores last session.
+# Configurable via DSH_NEW_CHAT or CLI flags (--new-chat / --resume).
+NEW_CHAT_DEFAULT = os.environ.get("DSH_NEW_CHAT", "1").strip().lower() in ("1", "true", "yes", "on")
+
 # Desktop environment, used only to produce a useful diagnostic. Nothing in
 # this script behaves differently per environment: the tray is probed at
 # runtime, so GNOME, KDE, XFCE, MATE, Cinnamon and tiling setups all take the
@@ -443,8 +447,58 @@ class DshWindow(QMainWindow):
             "<div>Starting DeepSeek Harness…</div></body>"
         )
 
+        self.start_new_chat = NEW_CHAT_DEFAULT
+        if "--new-chat" in sys.argv:
+            self.start_new_chat = True
+        elif "--resume" in sys.argv:
+            self.start_new_chat = False
+
+        self._new_chat_triggered = False
+        self.view.loadFinished.connect(self._on_load_finished)
+
         QTimer.singleShot(100, self.load_when_ready)
         self._tries = 0
+
+    def _on_load_finished(self, ok: bool) -> None:
+        if not ok or self._new_chat_triggered or not self.start_new_chat:
+            return
+        url_str = self.view.url().toString()
+        if not url_str.startswith("http"):
+            return
+        self._new_chat_triggered = True
+        # Allow client-side rendering/hydration to settle before triggering action
+        QTimer.singleShot(600, self._trigger_new_chat)
+
+    def _trigger_new_chat(self) -> None:
+        js = """
+        (function() {
+            var btn = document.querySelector('button[aria-label="New session"], button[aria-label="新建会话"]') ||
+                      document.querySelector('button[aria-keyshortcuts*="KeyN"]') ||
+                      Array.from(document.querySelectorAll('button')).find(function(b) {
+                          return b.textContent && (b.textContent.includes('New Session') || b.textContent.includes('新会话'));
+                      });
+            if (btn) {
+                btn.click();
+            } else {
+                window.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'n',
+                    code: 'KeyN',
+                    keyCode: 78,
+                    which: 78,
+                    ctrlKey: true,
+                    bubbles: true
+                }));
+            }
+            setTimeout(function() {
+                var ta = document.querySelector('textarea, [contenteditable="true"]');
+                if (ta) ta.focus();
+            }, 300);
+        })();
+        """
+        try:
+            self.view.page().runJavaScript(js)
+        except Exception:
+            pass
 
     def load_when_ready(self) -> None:
         if service_up():
@@ -590,7 +644,12 @@ def main() -> int:
         sock = QLocalSocket()
         sock.connectToServer(IPC_NAME)
         if sock.waitForConnected(800):
-            cmd = "update" if "--update" in sys.argv else "show"
+            if "--update" in sys.argv:
+                cmd = "update"
+            elif "--new-chat" in sys.argv:
+                cmd = "new-chat"
+            else:
+                cmd = "show"
             sock.write(cmd.encode("utf-8"))
             sock.waitForBytesWritten(800)
             sock.disconnectFromServer()
@@ -648,6 +707,9 @@ def main() -> int:
                 if msg == "update":
                     win._restore()
                     start_check()
+                elif msg == "new-chat":
+                    win._restore()
+                    win._trigger_new_chat()
                 elif msg == "show":
                     win._restore()
             client.disconnectFromServer()
