@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - 2026-09-27
+## 0.0.3 - 2026-09-27
 
 ### Added
 - **Tray Tailscale Remote Access Management:** Added checkable `Remote access (Tailscale)` action directly in the system tray menu to toggle `dsh-proxy.service` on and off on demand, eliminating the need to use the terminal.
