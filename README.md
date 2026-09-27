@@ -16,10 +16,11 @@ application on Linux:
 |---|---|
 | **Desktop shortcut** | A launcher entry with icon — no terminal needed |
 | **Tray shell** | QtWebEngine window; closing it (X) hides to the tray instead of quitting |
-| **Tray menu** | Show/hide, reload, service status, update check, real quit |
+| **Tray menu** | Show/hide, reload, service status, in-app update check & apply, real quit |
 | **systemd service** | `dsh-web.service` keeps DSH running independently of any window |
 | **Desktop notifications** | System notifications for turn, question, and error events |
-| **Update checker** | `dsh-update` — npm + GitHub release channels, desktop notification, version cleanup |
+| **In-app updates** | One-click update check and apply directly from the GUI or notification, with live log stream and auto-reload |
+| **Update CLI** | `dsh-update` — npm + GitHub release channels, automatic backup & rollback, version cleanup |
 | **Optional remote access** | Authenticated reverse proxy for Tailscale-style private networks |
 
 ### Desktop notifications
@@ -115,6 +116,13 @@ leaves you without DSH.
 
 The friendly default is a `systemd --user` timer that checks twice a day and
 notifies you when a new version exists.
+
+### In-app updates
+
+No terminal is required to check or install updates:
+- **Interactive Tray Dialog:** Select **Check for updates** in the tray menu. If an update is available, an **Apply Update** button appears.
+- **Notification Action:** Desktop notifications include a **View Update** button that opens the update dialog directly.
+- **Live Output Stream:** Before updating, an explicit prompt confirms that active agent turns will stop. Once confirmed, `dsh-update apply` runs with live stdout/stderr logging, and the window automatically reloads 3 seconds after a successful update.
 
 ---
 

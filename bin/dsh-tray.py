@@ -33,7 +33,8 @@ import urllib.parse
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QProcess, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QGuiApplication, QIcon
+from PyQt6.QtGui import QAction, QGuiApplication, QIcon, QTextCursor
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -41,12 +42,16 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QSystemTrayIcon,
     QVBoxLayout,
 )
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+IPC_NAME = "dsh-tray-ipc"
 
 APP_NAME = "dsh-tray"
 ICON = Path.home() / ".local/share/icons/dsh-desktop.png"
@@ -285,31 +290,124 @@ class UpdateChecker(QObject):
 def update_summary(code: int) -> str:
     if code == 10:
         return ("A new official version is available to install.\n"
-                "To install it, in a terminal: dsh-update apply\n"
-                "(The update stops dsh-web.service; the running agent session ends.)")
+                "Click 'Apply Update' below to install it now, or run 'dsh-update apply' in a terminal.\n"
+                "(The update stops dsh-web.service; any active agent turn will end.)")
     if code == 0:
         return "Installed version is up to date: there is no new rc release on the official channel."
     return "The check could not be completed (network, GitHub or npm could not be read)."
 
 
+class UpdateDialog(QDialog):
+    """Shows the update report with an optional 'Apply Update' action and live log output."""
+
+    def __init__(self, parent: DshWindow, code: int, report: str) -> None:
+        super().__init__(parent)
+        self.parent_win = parent
+        self.code = code
+        self.proc: QProcess | None = None
+
+        self.setWindowTitle("DSH update check")
+        self.resize(720, 480)
+        lay = QVBoxLayout(self)
+
+        self.head = QLabel(update_summary(code))
+        self.head.setWordWrap(True)
+        lay.addWidget(self.head)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setPlainText(report)
+        self.view.setStyleSheet("font-family:monospace;")
+        lay.addWidget(self.view)
+
+        self.buttons = QDialogButtonBox()
+        self.btn_close = self.buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        self.btn_close.clicked.connect(self.close)
+
+        if code == 10:
+            self.btn_apply = QPushButton("Apply Update")
+            self.btn_apply.setStyleSheet("font-weight: bold;")
+            self.btn_apply.clicked.connect(self.on_apply)
+            self.buttons.addButton(self.btn_apply, QDialogButtonBox.ButtonRole.ActionRole)
+        else:
+            self.btn_apply = None
+
+        lay.addWidget(self.buttons)
+
+    def on_apply(self) -> None:
+        if self.btn_apply is None:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Update",
+            "DeepSeek Harness service (dsh-web.service) will be stopped and updated.\n"
+            "Any in-progress agent turn or session will end.\n\n"
+            "Do you want to proceed with the update?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.setText("Updating…")
+        self.btn_close.setEnabled(False)
+
+        self.view.appendPlainText("\n" + "=" * 60 + "\nStarting update: dsh-update apply\n" + "=" * 60 + "\n")
+        self.view.moveCursor(QTextCursor.MoveOperation.End)
+
+        cmd = [*update_command(), "apply"]
+        proc = QProcess(self)
+        self.proc = proc
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(self._on_output)
+        proc.finished.connect(self._on_apply_finished)
+        proc.start(cmd[0], cmd[1:])
+
+    def _on_output(self) -> None:
+        if self.proc is None:
+            return
+        text = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        self.view.insertPlainText(text)
+        self.view.ensureCursorVisible()
+
+    def _on_apply_finished(self, code: int, status: QProcess.ExitStatus) -> None:
+        self.proc = None
+        self.btn_close.setEnabled(True)
+
+        if code == 0 and status == QProcess.ExitStatus.NormalExit:
+            self.view.appendPlainText("\n" + "=" * 60 + "\n✓ Update completed successfully!\n"
+                                     "Reloading interface in 3 seconds…\n" + "=" * 60)
+            self.view.moveCursor(QTextCursor.MoveOperation.End)
+            if self.btn_apply:
+                self.btn_apply.setText("Updated ✓")
+            QTimer.singleShot(3000, self._finish_reload)
+        else:
+            self.view.appendPlainText(f"\n! Update failed with exit code {code}.\n"
+                                     "See log above for details or rollback information.")
+            self.view.moveCursor(QTextCursor.MoveOperation.End)
+            if self.btn_apply:
+                self.btn_apply.setEnabled(True)
+                self.btn_apply.setText("Retry Update")
+
+    def _finish_reload(self) -> None:
+        try:
+            self.parent_win.view.reload()
+        except Exception:
+            pass
+        self.accept()
+
+    def closeEvent(self, event) -> None:
+        if self.proc is not None:
+            event.ignore()
+            return
+        event.accept()
+
+
 def show_update_report(parent, code: int, report: str) -> None:
     """Show the check result in a readable window with selectable text."""
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("DSH update check")
-    dlg.resize(700, 440)
-    lay = QVBoxLayout(dlg)
-    head = QLabel(update_summary(code))
-    head.setWordWrap(True)
-    lay.addWidget(head)
-    view = QPlainTextEdit()
-    view.setReadOnly(True)
-    view.setPlainText(report)
-    view.setStyleSheet("font-family:monospace;")
-    lay.addWidget(view)
-    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-    buttons.rejected.connect(dlg.reject)
-    buttons.accepted.connect(dlg.accept)
-    lay.addWidget(buttons)
+    dlg = UpdateDialog(parent, code, report)
     dlg.exec()
 
 
@@ -489,7 +587,15 @@ def main() -> int:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("dsh-tray: already running.", file=sys.stderr)
+        sock = QLocalSocket()
+        sock.connectToServer(IPC_NAME)
+        if sock.waitForConnected(800):
+            cmd = "update" if "--update" in sys.argv else "show"
+            sock.write(cmd.encode("utf-8"))
+            sock.waitForBytesWritten(800)
+            sock.disconnectFromServer()
+        else:
+            print("dsh-tray: already running.", file=sys.stderr)
         return 0
 
     win = DshWindow()
@@ -528,6 +634,26 @@ def main() -> int:
 
     checker.finished.connect(finish_check)
     act_update.triggered.connect(start_check)
+
+    # IPC Server for single-instance communication
+    ipc_server = QLocalServer(win)
+    QLocalServer.removeServer(IPC_NAME)
+    if ipc_server.listen(IPC_NAME):
+        def handle_ipc() -> None:
+            client = ipc_server.nextPendingConnection()
+            if not client:
+                return
+            if client.waitForReadyRead(800):
+                msg = bytes(client.readAll()).decode("utf-8").strip()
+                if msg == "update":
+                    win._restore()
+                    start_check()
+                elif msg == "show":
+                    win._restore()
+            client.disconnectFromServer()
+
+        ipc_server.newConnection.connect(handle_ipc)
+        win._ipc_server = ipc_server
 
     def real_quit() -> None:
         """Really close the shell (the service keeps running).
@@ -568,6 +694,8 @@ def main() -> int:
     # Some compositors (Wayland) can swallow the first maximize request; if it
     # is still not maximized shortly after, ask once more.
     QTimer.singleShot(400, win.ensure_startup_state)
+    if "--update" in sys.argv:
+        QTimer.singleShot(600, start_check)
 
     # Report a missing tray once, with advice specific to this desktop. Every
     # environment takes the same code path -- the tray is probed, never assumed

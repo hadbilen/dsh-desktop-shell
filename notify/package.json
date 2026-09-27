@@ -1,6 +1,6 @@
 {
   "name": "dsh-notify",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Desktop notifications for DeepSeek Harness: notify when a reply completes, when the agent asks a question, and when a run fails.",
   "type": "module",
   "main": "lib/index.js",

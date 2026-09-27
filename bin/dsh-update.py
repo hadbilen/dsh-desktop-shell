@@ -542,26 +542,28 @@ def have_notify_send() -> bool:
     return shutil.which("notify-send") is not None
 
 
-def notify_send(title: str, body: str, urgency: str = "normal") -> tuple[bool, str]:
-    """Deliver a desktop notification; return (delivered, diagnostic).
+def notify_send(title: str, body: str, urgency: str = "normal",
+                action: tuple[str, str] | None = None) -> tuple[bool, str, str]:
+    """Deliver a desktop notification; return (delivered, diagnostic, action_chosen).
 
     Works with any freedesktop-compliant notification daemon, which covers
     GNOME (including the AppIndicator extension), KDE Plasma, XFCE, MATE,
     Cinnamon, Budgie and most tiling setups. Where no daemon is running this
-    returns False with a human-readable reason instead of failing silently.
+    returns (False, reason, "") instead of failing silently.
 
     @param title - notification title.
     @param body - notification body.
     @param urgency - "low", "normal" or "critical".
-    @returns (True, "") on success, otherwise (False, reason).
+    @param action - optional (key, label) e.g. ("update", "View Update").
+    @returns (True, "", action_chosen) on success, otherwise (False, reason, "").
     """
     if not have_notify_send():
-        return False, "notify-send is not installed (package: libnotify-bin)"
+        return False, "notify-send is not installed (package: libnotify-bin)", ""
 
     bus = session_bus_address()
     if bus is None:
         return False, ("no D-Bus session bus found; not running inside a "
-                       "graphical session?")
+                       "graphical session?"), ""
 
     env = dict(os.environ)
     env["DBUS_SESSION_BUS_ADDRESS"] = bus
@@ -569,17 +571,33 @@ def notify_send(title: str, body: str, urgency: str = "normal") -> tuple[bool, s
     args = ["notify-send", "-a", "DSH", "-u", urgency]
     if ICON.exists():
         args += ["-i", str(ICON)]
+    if action is not None:
+        key, label = action
+        args += ["-t", "15000", "-A", f"{key}={label}"]
     args += [title, body]
 
     try:
         r = subprocess.run(args, capture_output=True, text=True, env=env)
     except OSError as e:
-        return False, f"could not run notify-send: {e}"
+        return False, f"could not run notify-send: {e}", ""
+
+    # If -A failed (e.g. older notify-send or daemon rejecting actions), retry without action
+    if r.returncode != 0 and action is not None:
+        fallback_args = ["notify-send", "-a", "DSH", "-u", urgency]
+        if ICON.exists():
+            fallback_args += ["-i", str(ICON)]
+        fallback_args += [title, body]
+        try:
+            r = subprocess.run(fallback_args, capture_output=True, text=True, env=env)
+        except OSError as e:
+            return False, f"could not run notify-send: {e}", ""
 
     if r.returncode != 0:
         detail = (r.stderr or r.stdout).strip() or f"exit code {r.returncode}"
-        return False, f"notify-send failed: {detail}"
-    return True, ""
+        return False, f"notify-send failed: {detail}", ""
+
+    action_chosen = (r.stdout or "").strip()
+    return True, "", action_chosen
 
 
 # --------------------------------------------------------------------------- #
@@ -765,14 +783,28 @@ def cmd_notify() -> int:
         extra = (f"\nThere are also {sum(st['other_versions'].values())} unwanted package copies on disk; "
                  f"the update deletes them.")
     body = (f"Installed: {installed}\nNewest rc: {rc}{extra}\n\n"
-            f"To install, in a terminal: dsh-update apply")
+            f"Click 'View Update' to inspect and apply within DeepSeek Harness,\n"
+            f"or in a terminal run: dsh-update apply")
 
-    delivered, reason = notify_send("DSH: new rc version", body)
+    delivered, reason, action_taken = notify_send(
+        "DSH: new rc version", body, action=("update", "View Update")
+    )
     if delivered:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         state["notified_rc"] = rc
         STATE.write_text(json.dumps(state, indent=2) + "\n")
         print(f"dsh-update: notified → {rc}")
+        if action_taken == "update":
+            launcher = HOME / ".local/bin/dsh-desktop-launch.sh"
+            if not launcher.is_file():
+                candidate = Path(__file__).resolve().parent / "dsh-desktop-launch.sh"
+                if candidate.is_file():
+                    launcher = candidate
+            if launcher.is_file():
+                try:
+                    subprocess.Popen([str(launcher), "--update"], start_new_session=True)
+                except Exception as e:
+                    print(f"dsh-update: could not launch GUI: {e}", file=sys.stderr)
         return 0
 
     # Not delivered (no bus, no daemon, no notify-send). The state file is NOT
@@ -1352,7 +1384,7 @@ def cmd_full(argv: list[str]) -> int:
     body = (f"Installed version: {st2['installed']}\n"
             f"Other version copies: {sum(st2['other_versions'].values())}\n"
             f"Refresh the clients: 'Refresh' in the shell, reload the page in the browser.")
-    delivered, reason = notify_send("DSH updated", body)
+    delivered, reason, _ = notify_send("DSH updated", body)
     if delivered:
         print("\nThe completion notification was sent (the desktop notification path works).")
     else:
