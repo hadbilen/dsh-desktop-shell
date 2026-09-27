@@ -137,7 +137,7 @@ network such as Tailscale.
 No manual terminal configuration is needed:
 1. Open the tray menu and check **Remote access (Tailscale)**.
 2. If `~/.config/dsh/proxy.env` does not exist yet, a secure 32-byte token is automatically generated and bound to your active Tailscale IP (`tailscale ip -4`).
-3. The ready-to-use URL (`http://<tailscale-ip>:3000/?token=...`) is automatically copied to your clipboard.
+3. The ready-to-use URL (`http://<tailscale-ip>:3000/?token=...`) is automatically copied to your clipboard. On first visit, the proxy verifies the token, strips it from the upstream request, and issues a secure `Set-Cookie` (`dsh_proxy_token`) so subsequent requests, assets, and WebSocket streams persist seamlessly.
 4. Click **Copy remote link** in the tray menu anytime you need the link on your phone or remote browser.
 5. Unchecking the option immediately stops `dsh-proxy.service` and returns DSH to loopback-only isolation.
 
@@ -154,20 +154,11 @@ systemctl --user enable --now dsh-proxy.service
 
 Then visit `http://<tailscale-ip>:3000/?token=<your-token>`.
 
-### Security notes
+### Security and networking notes
 
-The proxy deliberately does **not**:
-
-- inject `window.__DSH_TRANSPORT__ = { ownsHost: true }` — that upstream flag
-  tells the DSH client it is running on the host machine, which grants remote
-  browsers the host's settings-write path
-- rewrite `Host`, `Origin`, or `Sec-Fetch-Site` — DSH's trust fence decides
-  whether a request is loopback-trusted from exactly those headers
-
-Earlier versions did both. If you run an older copy, update.
-
-For LAN trust without a proxy, prefer DSH's own supported mechanism
-(`dsh web --trusted-host <name>`) over header rewriting.
+- **Authentication & session persistence:** Access requires the shared secret via `Bearer <token>`, `?token=<secret>`, or the `dsh_proxy_token` cookie. The proxy strips the token parameter before forwarding requests upstream to avoid collisions with DSH's internal `processLaunchToken`.
+- **Host normalization:** The proxy normalizes incoming `Host` headers to the upstream loopback address so DSH accepts the proxied connection without requiring manual `--trusted-host` adjustments, while preserving the original host in `X-Forwarded-Host`.
+- **Client safety:** The proxy deliberately does **not** inject `window.__DSH_TRANSPORT__ = { ownsHost: true }` — that upstream flag tells the DSH client it is running on the host machine, which would grant remote browsers the host's settings-write path.
 
 ---
 
@@ -201,7 +192,7 @@ All scripts read environment variables; nothing hardcodes a username.
 
 | Variable | Used by | Default |
 |---|---|---|
-| `DSH_WEB_URL` | tray, browser window, proxy | `http://127.0.0.1:3080` |
+| `DSH_WEB_URL` | tray, browser window, proxy, updater | `http://127.0.0.1:3080` |
 | `DSH_TRAY_WINDOW` | tray launcher | `maximized` (`fullscreen`/`normal`) |
 | `DSH_NEW_CHAT` | tray launcher | `1` (clean new chat) / `0` (restore last) |
 | `DSH_CHROME` | browser window fallback | auto-detected (Chrome, Chromium, Brave, Edge) |
@@ -269,6 +260,9 @@ desktop, then keeps working: the window simply closes instead of hiding.
 **The window never appears / "already running"**
 The tray shell holds a lock file. If a previous run is stuck:
 `pkill -f dsh-tray.py`, then relaunch.
+
+**Service startup timeout / "Starting DeepSeek Harness…"**
+If `dsh-web.service` does not become reachable within 30 seconds, the shell displays an interactive diagnostics screen showing the service URL, relevant `journalctl` inspection commands, and a direct "Retry Connection" button.
 
 **Chrome window instead of the tray shell**
 PyQt6 WebEngine is missing: `sudo apt install python3-pyqt6.qtwebengine`.
