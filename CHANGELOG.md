@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.0.4 - 2026-09-27
+
+### Fixed & Improved
+- **GUI Non-Interactive Update:** Added `--yes` flag to `dsh-update apply` execution in `dsh-tray.py`, allowing GUI one-click updates to run without terminal prompt hangs.
+- **Tailscale Reverse Proxy Robustness & Security:**
+  - Authenticated query parameter (`?token=...`) is stripped before forwarding upstream, eliminating collision with DSH internal `processLaunchToken` (resolving 401 errors).
+  - Issued `Set-Cookie` (`HttpOnly; SameSite=Lax`) upon token verification so subsequent browser asset requests and WebSocket upgrades remain authenticated seamlessly.
+  - Cleaned up stream listeners (`proxyRes.removeListener`) upon exceeding the 4MB HTML buffer limit to prevent duplicate chunks and double `res.end()` crashes.
+  - Normalized Host header to upstream loopback while preserving original client host in `X-Forwarded-Host`.
+- **Browser Window Guard:** Added immediate exit in `dsh-app-window.sh` when `dsh-web.service` is unreachable, preventing browser launch against a dead service.
+- **Update Tooling & Service Compatibility:**
+  - Dynamically resolved `DSH_WEB_URL` for status checks and service connectivity in `dsh-update.py`.
+  - Returned exit code `0` in `dsh-update notify` when desktop notification daemon or session is missing, eliminating spurious systemd timer failure states.
+- **Installer & Runtime Hardening:**
+  - Removed PyYAML requirement in `install.sh`; implemented safe standard-library validation for `cordis.patch.yml`.
+  - Added atomic manifest updates and guaranteed rollback of `package.json` if YAML validation or plugin import fails.
+  - Added Node.js V8 engine validation guard (`process.versions.v8`) in `dsh-launcher.sh` and removed Bun masquerading as node.
+  - Templated binary directories (`__BIN_DIR__`) in `dsh-proxy.service` and `dsh-update-check.service` to support custom installation directories.
+- **Tray & Desktop Integration Polish:**
+  - Migrated IPC socket from `/tmp/dsh-tray-ipc` to user's `XDG_RUNTIME_DIR` (`dsh-tray-<uid>.sock`).
+  - Created `proxy.env` with `0o600` permissions directly via `os.open` to eliminate TOCTOU security races.
+  - Added interactive error guidance and troubleshooting actions in `dsh-tray.py` when service fails to respond within timeout.
+  - Stopped `killer` timer in `UpdateChecker` upon process termination.
+  - Cached `is_proxy_active()` status checks to eliminate UI stutter when opening the tray context menu.
+  - Aligned `StartupWMClass` and application name to `"DSH-Desktop"` across `.desktop` entry and Qt application.
+- **Uninstaller Purge Cleanup:** `uninstall.sh --purge` now completely cleans `~/.config/dsh/proxy.env` and the Chrome profile directory (`dsh-app`).
+
 ## 0.0.3 - 2026-09-27
 
 ### Added

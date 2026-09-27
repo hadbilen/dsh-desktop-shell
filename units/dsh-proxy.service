@@ -16,7 +16,7 @@ EnvironmentFile=-%h/.config/dsh/proxy.env
 Environment=DSH_PROXY_BIND=127.0.0.1
 Environment=DSH_PROXY_PORT=3000
 Environment=DSH_WEB_URL=http://127.0.0.1:3080
-ExecStart=__NODE__ %h/.local/bin/dsh-tailscale-proxy.mjs
+ExecStart=__NODE__ __BIN_DIR__/dsh-tailscale-proxy.mjs
 Restart=always
 RestartSec=3
 

@@ -154,7 +154,10 @@ if [ "$PURGE" = 1 ]; then
   run rm -rf "$PROFILE_DIR"/cordis.patch.yml.bak.*
   run rm -rf "$HOME/.cache/dsh-update"
   run rm -rf "$DATA_DIR/dsh-tray"
-  say "local state and backups removed"
+  run rm -rf "$DATA_DIR/dsh-app"
+  run rm -f "$CONF_DIR/dsh/proxy.env"
+  [ -d "$CONF_DIR/dsh" ] && rmdir "$CONF_DIR/dsh" 2>/dev/null || true
+  say "local state, proxy configuration, and backups removed"
   say "(versions, sessions and the profile were preserved)"
 fi
 

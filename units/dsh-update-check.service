@@ -13,7 +13,7 @@ Type=oneshot
 # XDG_RUNTIME_DIR locates the user's runtime directory; the bus address is
 # derived from it in the script, with a fallback to the conventional path.
 Environment=XDG_RUNTIME_DIR=%t
-ExecStart=__PYTHON__ %h/.local/bin/dsh-update.py notify
+ExecStart=__PYTHON__ __BIN_DIR__/dsh-update.py notify
 # `notify` already returns 0 on network/GitHub errors (see cmd_notify).
 # SuccessExitStatus is not used here: 0 already means success and a genuine
 # crash must not be hidden.

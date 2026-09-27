@@ -54,7 +54,7 @@ GLOBAL_NM = GLOBAL / "node_modules"
 PROFILE_NM = HOME / ".dsh/profiles/node_modules"
 CACHE_SCOPE = BUN_DIR / "install/cache/@deepseek-ai"
 SERVICE = "dsh-web.service"
-URL = "http://127.0.0.1:3080"
+URL = os.environ.get("DSH_WEB_URL", "http://127.0.0.1:3080").rstrip("/")
 STATE_DIR = HOME / ".cache/dsh-update"
 STATE = STATE_DIR / "state.json"
 ICON = HOME / ".local/share/icons/dsh-desktop.png"
@@ -465,9 +465,15 @@ def systemctl(*args: str) -> subprocess.CompletedProcess:
 
 def service_up(timeout: float = 2.0) -> bool:
     import http.client
+    import urllib.parse
     try:
-        c = http.client.HTTPConnection("127.0.0.1", 3080, timeout=timeout)
-        c.request("GET", "/")
+        target = os.environ.get("DSH_WEB_URL", URL)
+        p = urllib.parse.urlsplit(target)
+        host = p.hostname or "127.0.0.1"
+        port = p.port or (443 if p.scheme == "https" else 80)
+        conn_cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
+        c = conn_cls(host, port, timeout=timeout)
+        c.request("GET", p.path or "/")
         c.getresponse().status          # even 401 means "up"
         c.close()
         return True
@@ -812,7 +818,7 @@ def cmd_notify() -> int:
     # notification must never be a silent mystery.
     print(f"dsh-update: notification not delivered — {reason}", file=sys.stderr)
     print(f"dsh-update: new version {rc} is available (installed: {installed})")
-    return 1
+    return 0
 
 
 # --------------------------------------------------------------------------- #

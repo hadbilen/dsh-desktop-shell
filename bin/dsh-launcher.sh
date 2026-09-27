@@ -17,21 +17,23 @@
 set -euo pipefail
 
 # 1) Locate node: explicit setting first, then PATH, then common locations.
+# Standard Node.js with V8 engine is strictly required (rejects Bun masquerading as node).
 find_node() {
-  if [ -n "${DSH_NODE:-}" ] && [ -x "${DSH_NODE}" ]; then
-    printf '%s' "$DSH_NODE"; return 0
-  fi
-  if command -v node >/dev/null 2>&1; then
-    command -v node; return 0
-  fi
   local cand
   for cand in \
-    "$HOME/.bun/bin/node" \
-    /usr/local/bin/node \
+    "${DSH_NODE:-}" \
+    "$(command -v node 2>/dev/null || true)" \
     /usr/bin/node \
+    /usr/local/bin/node \
+    "$HOME/.local/bin/node" \
     /opt/homebrew/bin/node
   do
-    [ -x "$cand" ] && { printf '%s' "$cand"; return 0; }
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+      if "$cand" -e 'process.exit(process.versions.v8 ? 0 : 1)' >/dev/null 2>&1; then
+        printf '%s' "$cand"
+        return 0
+      fi
+    fi
   done
   return 1
 }
@@ -57,7 +59,7 @@ find_dsh() {
 }
 
 NODE="$(find_node)" || {
-  echo "dsh: node not found. Set DSH_NODE to its absolute path." >&2
+  echo "dsh: Node.js with V8 engine not found. Set DSH_NODE to its absolute path." >&2
   exit 1
 }
 

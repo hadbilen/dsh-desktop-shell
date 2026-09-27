@@ -96,6 +96,7 @@ EOF
       "dsh-web.service is not responding. Details: journalctl --user -u dsh-web.service -n 50" \
       2>/dev/null || true
   fi
+  exit 1
 fi
 
 # Is bootstrapping needed? Yes when the profile was never set up, or the marker

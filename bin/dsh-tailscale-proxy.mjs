@@ -16,11 +16,9 @@
  *     that upstream deliberately disables becomes available. Remote clients
  *     are NOT given that authority.
  *
- *  2. `Host`, `Origin` and `Sec-Fetch-Site` headers are NEVER rewritten.
- *     The upstream trust fence (dsh-client-connection/lib/index.js) treats a
- *     request as trusted only when Host is loopback AND sec-fetch-site is not
- *     cross-site AND Origin equals Host. "Fixing" those three disables the
- *     fence entirely. Use `--trusted-host <address>` on the DSH side instead.
+ *  2. `Host` header is normalized to loopback (${TARGET_HOST}:${targetPort}) so upstream
+ *     DSH accepts reverse-proxied requests behind authentication, preserving the
+ *     client's host in `X-Forwarded-Host`. Origin and Sec-Fetch-Site are not modified.
  *
  *  3. The proxy REQUIRES authentication. When the `DSH_PROXY_TOKEN` environment
  *     variable is set, every request must carry `Authorization: Bearer <token>`
@@ -123,24 +121,105 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+const COOKIE_NAME = 'dsh_proxy_token';
+
 /**
- * Checks whether the request carries the valid shared secret.
+ * Parses a cookie value by name from request headers.
+ * @param {http.IncomingMessage} req
+ * @param {string} name
+ * @returns {string|null}
+ */
+function getCookie(req, name) {
+  const cookieHeader = req.headers['cookie'];
+  if (!cookieHeader) return null;
+  const cookies = cookieHeader.split(';');
+  for (const c of cookies) {
+    const [k, ...v] = c.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+}
+
+/**
+ * Strips the ?token= parameter from the URL before forwarding upstream.
+ * Upstream DSH uses processLaunchToken which causes 401 collisions if an external
+ * proxy token is forwarded.
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function sanitizePath(rawUrl) {
+  try {
+    const url = new URL(rawUrl || '/', 'http://localhost');
+    if (url.searchParams.has('token')) {
+      url.searchParams.delete('token');
+      const qs = url.searchParams.toString();
+      return url.pathname + (qs ? `?${qs}` : '') + url.hash;
+    }
+  } catch {
+    /* malformed URL */
+  }
+  return rawUrl || '/';
+}
+
+/**
+ * Appends Set-Cookie header for proxy token authentication.
+ * @param {Record<string, any>} headers
+ * @param {string} token
+ */
+function attachSetCookie(headers, token) {
+  const cookieVal = `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`;
+  const existing = headers['set-cookie'];
+  if (!existing) {
+    headers['set-cookie'] = [cookieVal];
+  } else if (Array.isArray(existing)) {
+    headers['set-cookie'] = [...existing, cookieVal];
+  } else {
+    headers['set-cookie'] = [existing, cookieVal];
+  }
+}
+
+/**
+ * Checks whether the request carries the valid shared secret and whether a cookie should be set.
+ * @param {http.IncomingMessage} req
+ * @returns {{ authorized: boolean, setCookie: boolean }}
+ */
+function checkAuth(req) {
+  if (!REMOTE_ENABLED) return { authorized: true, setCookie: false };
+
+  // 1. Authorization: Bearer <token>
+  const header = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(String(header));
+  if (m && safeEqual(m[1].trim(), PROXY_TOKEN)) {
+    return { authorized: true, setCookie: false };
+  }
+
+  // 2. Cookie: dsh_proxy_token=<token>
+  const cookieToken = getCookie(req, COOKIE_NAME);
+  if (cookieToken && safeEqual(cookieToken, PROXY_TOKEN)) {
+    return { authorized: true, setCookie: false };
+  }
+
+  // 3. Query: ?token=<token> -> issue Set-Cookie on verification
+  try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    const q = url.searchParams.get('token');
+    if (q && safeEqual(q, PROXY_TOKEN)) {
+      return { authorized: true, setCookie: true };
+    }
+  } catch {
+    /* malformed URL: treat as unauthorized */
+  }
+
+  return { authorized: false, setCookie: false };
+}
+
+/**
+ * Backwards-compatible check.
  * @param {http.IncomingMessage} req
  * @returns {boolean}
  */
 function authorized(req) {
-  if (!REMOTE_ENABLED) return true; // listening on loopback only
-  const header = req.headers['authorization'] || '';
-  const m = /^Bearer\s+(.+)$/i.exec(String(header));
-  if (m && safeEqual(m[1].trim(), PROXY_TOKEN)) return true;
-  try {
-    const url = new URL(req.url || '/', 'http://localhost');
-    const q = url.searchParams.get('token');
-    if (q && safeEqual(q, PROXY_TOKEN)) return true;
-  } catch {
-    /* malformed URL: treat as unauthorized */
-  }
-  return false;
+  return checkAuth(req).authorized;
 }
 
 /**
@@ -166,7 +245,8 @@ function getTargetPort() {
 
 const server = http.createServer((req, res) => {
   // 1) Authentication: with remote access on, the shared secret is required.
-  if (!authorized(req)) {
+  const { authorized: isAuth, setCookie } = checkAuth(req);
+  if (!isAuth) {
     res.writeHead(401, {
       'Content-Type': 'text/plain; charset=utf-8',
       'WWW-Authenticate': 'Bearer realm="dsh-proxy"',
@@ -177,7 +257,9 @@ const server = http.createServer((req, res) => {
 
   const targetPort = getTargetPort();
   if (!targetPort) {
-    res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8' });
+    const errHeaders = { 'Content-Type': 'text/html; charset=utf-8' };
+    if (setCookie) attachSetCookie(errHeaders, PROXY_TOKEN);
+    res.writeHead(503, errHeaders);
     res.end(`<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>DeepSeek Harness</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
@@ -190,14 +272,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 2) Headers are passed through verbatim. Host/Origin/Sec-Fetch-Site are
-  //    not rewritten: the upstream trust fence relies on those values.
+  // 2) Headers: Normalize Host header to loopback so upstream DSH accepts the
+  //    reverse-proxied request behind the authentication layer, and preserve original
+  //    host in X-Forwarded-Host.
   const headers = { ...req.headers };
-  // DSH listens on loopback only, so the connection target is fixed; the
-  // Host header keeps the value the client saw and the fence evaluates it.
+  if (req.headers['host']) {
+    headers['x-forwarded-host'] = req.headers['host'];
+  }
+  headers['host'] = `${TARGET_HOST}:${targetPort}`;
+
+  // Sanitize path so upstream does not collide with processLaunchToken
+  const upstreamPath = sanitizePath(req.url);
 
   const isPotentialHtml = req.method === 'GET'
-    && (req.url === '/' || req.url.startsWith('/?') || req.url.endsWith('.html')
+    && (upstreamPath === '/' || upstreamPath.startsWith('/?') || upstreamPath.endsWith('.html')
         || (headers['accept'] && headers['accept'].includes('text/html')));
   if (isPotentialHtml) {
     // Compression is disabled so the injection stays clean.
@@ -208,7 +296,7 @@ const server = http.createServer((req, res) => {
     {
       host: TARGET_HOST,
       port: targetPort,
-      path: req.url,
+      path: upstreamPath,
       method: req.method,
       headers: headers,
     },
@@ -220,22 +308,28 @@ const server = http.createServer((req, res) => {
         // Memory guard: stream very large responses instead of buffering.
         const MAX_BUFFER = 4 * 1024 * 1024;
         let aborted = false;
-        proxyRes.on('data', (chunk) => {
+
+        const onData = (chunk) => {
           total += chunk.length;
           if (total > MAX_BUFFER) {
-            if (!aborted) {
-              aborted = true;
-              res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            aborted = true;
+            proxyRes.removeListener('data', onData);
+            const responseHeaders = { ...proxyRes.headers };
+            if (setCookie) attachSetCookie(responseHeaders, PROXY_TOKEN);
+            res.writeHead(proxyRes.statusCode, responseHeaders);
+            if (chunks.length > 0) {
               res.write(Buffer.concat(chunks));
-              proxyRes.pipe(res);
             }
             res.write(chunk);
+            proxyRes.pipe(res);
             return;
           }
           chunks.push(chunk);
-        });
+        };
+
+        proxyRes.on('data', onData);
         proxyRes.on('end', () => {
-          if (aborted) { res.end(); return; }
+          if (aborted) return;
           let html = Buffer.concat(chunks).toString('utf-8');
           html = injectPolyfill(html);
 
@@ -244,11 +338,14 @@ const server = http.createServer((req, res) => {
           delete responseHeaders['etag'];
           responseHeaders['content-type'] = 'text/html; charset=utf-8';
           responseHeaders['content-length'] = Buffer.byteLength(html);
+          if (setCookie) attachSetCookie(responseHeaders, PROXY_TOKEN);
           res.writeHead(proxyRes.statusCode, responseHeaders);
           res.end(html);
         });
       } else {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        const responseHeaders = { ...proxyRes.headers };
+        if (setCookie) attachSetCookie(responseHeaders, PROXY_TOKEN);
+        res.writeHead(proxyRes.statusCode, responseHeaders);
         proxyRes.pipe(res);
       }
     }
@@ -297,18 +394,22 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   const targetPort = getTargetPort();
+  const upstreamPath = sanitizePath(req.url);
   // The query string (which may carry a token) is not written to the journal.
-  const safePath = String(req.url || '/').split('?')[0];
+  const safePath = String(upstreamPath).split('?')[0];
   if (!targetPort) {
     socket.destroy();
     return;
   }
 
   const targetSocket = net.connect(targetPort, TARGET_HOST, () => {
-    // Headers are passed through verbatim (see rule 2 on the HTTP path).
     const headers = { ...req.headers };
+    if (req.headers['host']) {
+      headers['x-forwarded-host'] = req.headers['host'];
+    }
+    headers['host'] = `${TARGET_HOST}:${targetPort}`;
 
-    let rawReq = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+    let rawReq = `${req.method} ${upstreamPath} HTTP/${req.httpVersion}\r\n`;
     for (const [key, value] of Object.entries(headers)) {
       if (Array.isArray(value)) {
         for (const v of value) rawReq += `${key}: ${v}\r\n`;

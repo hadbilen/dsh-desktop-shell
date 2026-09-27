@@ -29,6 +29,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -52,9 +53,20 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
-IPC_NAME = "dsh-tray-ipc"
 
-APP_NAME = "dsh-tray"
+def _get_ipc_socket() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime):
+        return os.path.join(runtime, f"dsh-tray-{os.getuid()}.sock")
+    candidate = f"/run/user/{os.getuid()}"
+    if os.path.isdir(candidate):
+        return os.path.join(candidate, f"dsh-tray-{os.getuid()}.sock")
+    return os.path.join(tempfile.gettempdir(), f"dsh-tray-{os.getuid()}.sock")
+
+
+IPC_NAME = _get_ipc_socket()
+
+APP_NAME = "DSH-Desktop"
 ICON = Path.home() / ".local/share/icons/dsh-desktop.png"
 DATA = Path(os.environ.get("DSH_TRAY_DATA", Path.home() / ".local/share/dsh-tray"))
 LOCK = DATA / ".lock"
@@ -252,23 +264,33 @@ def ensure_proxy_config() -> tuple[str, str, int]:
         f"DSH_PROXY_BIND={bind}\n"
         f"DSH_PROXY_PORT={port}\n"
     )
-    PROXY_ENV.write_text(content)
-    try:
-        PROXY_ENV.chmod(0o600)
-    except OSError:
-        pass
+    # Open directly with 0o600 to prevent TOCTOU race
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(PROXY_ENV, flags, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write(content)
 
     return token, bind, port
 
 
-def is_proxy_active() -> bool:
-    """Return True if dsh-proxy.service is active."""
+_last_proxy_check = 0.0
+_cached_proxy_active = False
+
+
+def is_proxy_active(force: bool = False) -> bool:
+    """Return True if dsh-proxy.service is active, using short TTL cache to avoid blocking GUI."""
+    global _last_proxy_check, _cached_proxy_active
+    now = time.monotonic()
+    if not force and (now - _last_proxy_check < 2.0):
+        return _cached_proxy_active
     try:
         r = subprocess.run(["systemctl", "--user", "is-active", PROXY_SERVICE],
-                           capture_output=True, text=True, timeout=2.0)
-        return r.stdout.strip() == "active"
+                           capture_output=True, text=True, timeout=0.8)
+        _cached_proxy_active = (r.stdout.strip() == "active")
+        _last_proxy_check = now
     except Exception:
-        return False
+        _cached_proxy_active = False
+    return _cached_proxy_active
 
 
 def get_remote_url() -> str | None:
@@ -325,6 +347,7 @@ class UpdateChecker(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.proc: QProcess | None = None
+        self.killer: QTimer | None = None
 
     def running(self) -> bool:
         return self.proc is not None
@@ -338,7 +361,8 @@ class UpdateChecker(QObject):
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         proc.finished.connect(self._on_finished)
         proc.errorOccurred.connect(self._on_error)
-        killer = QTimer(proc)  # the check must not wait forever when there is no network
+        killer = QTimer(self)  # the check must not wait forever when there is no network
+        self.killer = killer
         killer.setSingleShot(True)
         killer.setInterval(CHECK_TIMEOUT * 1000)
         killer.timeout.connect(proc.kill)
@@ -347,6 +371,9 @@ class UpdateChecker(QObject):
 
     def abort(self) -> None:
         """Silently kill the running check on exit (emits no signal)."""
+        if self.killer is not None:
+            self.killer.stop()
+            self.killer = None
         if self.proc is None:
             return
         proc, self.proc = self.proc, None
@@ -363,6 +390,9 @@ class UpdateChecker(QObject):
         return "\n".join(p for p in (out, err) if p) or "(no output)"
 
     def _on_finished(self, code: int, status) -> None:
+        if self.killer is not None:
+            self.killer.stop()
+            self.killer = None
         if self.proc is None:
             return
         report = self._report()
@@ -373,6 +403,9 @@ class UpdateChecker(QObject):
         self.finished.emit(code, report)
 
     def _on_error(self, error) -> None:
+        if self.killer is not None:
+            self.killer.stop()
+            self.killer = None
         # In the Crashed case finished() also arrives; _on_finished handles it.
         if self.proc is None or error == QProcess.ProcessError.Crashed:
             return
@@ -447,10 +480,10 @@ class UpdateDialog(QDialog):
         self.btn_apply.setText("Updating…")
         self.btn_close.setEnabled(False)
 
-        self.view.appendPlainText("\n" + "=" * 60 + "\nStarting update: dsh-update apply\n" + "=" * 60 + "\n")
+        self.view.appendPlainText("\n" + "=" * 60 + "\nStarting update: dsh-update apply --yes\n" + "=" * 60 + "\n")
         self.view.moveCursor(QTextCursor.MoveOperation.End)
 
-        cmd = [*update_command(), "apply"]
+        cmd = [*update_command(), "apply", "--yes"]
         proc = QProcess(self)
         self.proc = proc
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -599,6 +632,22 @@ class DshWindow(QMainWindow):
                            capture_output=True)
         if self._tries < 60:
             QTimer.singleShot(500, self.load_when_ready)
+        else:
+            error_html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>DeepSeek Harness</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
+  <h2>DeepSeek Harness failed to start</h2>
+  <p>The DSH Web service ({URL}) is not responding after 30 seconds.</p>
+  <div style="background: #1e293b; padding: 15px; border-radius: 8px; display: inline-block; text-align: left; margin: 20px auto; font-family: monospace; font-size: 13px;">
+    <div><strong>Status:</strong> systemctl --user status dsh-web.service</div>
+    <div><strong>Log:</strong> journalctl --user -u dsh-web.service -n 50</div>
+    <div><strong>Start:</strong> systemctl --user start dsh-web.service</div>
+  </div>
+  <p><button onclick="location.reload()" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;">Retry Connection</button></p>
+</body>
+</html>"""
+            self.view.setHtml(error_html, QUrl(URL))
 
     def show_startup(self) -> None:
         """Show the window according to DSH_TRAY_WINDOW mode (default: maximized)."""
@@ -853,9 +902,10 @@ def main() -> int:
     act_copy_url.triggered.connect(on_copy_url)
 
     def on_toggle_proxy() -> None:
-        if is_proxy_active():
+        if is_proxy_active(force=True):
             subprocess.run(["systemctl", "--user", "stop", PROXY_SERVICE],
                            capture_output=True)
+            is_proxy_active(force=True)
             act_proxy.setChecked(False)
             act_copy_url.setEnabled(False)
             tray.showMessage(
@@ -868,7 +918,7 @@ def main() -> int:
             token, bind, port = ensure_proxy_config()
             subprocess.run(["systemctl", "--user", "start", PROXY_SERVICE],
                            capture_output=True)
-            active = is_proxy_active()
+            active = is_proxy_active(force=True)
             act_proxy.setChecked(active)
             act_copy_url.setEnabled(active)
             if active:

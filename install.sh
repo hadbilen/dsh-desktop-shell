@@ -227,6 +227,8 @@ if [ "$WITH_SERVICES" = 1 ]; then
       sed -e "s|__NODE__|$NODE|g" \
           -e "s|__DSH_BIN__|$DSH_BIN|g" \
           -e "s|__PYTHON__|$PYTHON|g" \
+          -e "s|__BIN_DIR__|$BIN_DIR|g" \
+          -e "s|@BIN_DIR@|$BIN_DIR|g" \
           "$REPO_DIR/units/$unit" > "$UNIT_DIR/$unit"
       chmod 0644 "$UNIT_DIR/$unit"
       say "$unit"
@@ -310,16 +312,42 @@ if [ "$WITH_PLUGIN" = 1 ]; then
       say "! plugin NOT linked: dependencies are missing."
       say "  Fix with: cd $PLUGIN_DIR && pnpm install && ./install.sh"
     else
-      # 1) Link the plugin into the profile manifest.
+      remove_plugin_from_manifest() {
+        "$PYTHON" - "$PROFILE_DIR/package.json" <<'PY'
+import json, os, sys, tempfile
+p = sys.argv[1]
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    deps = data.get("dependencies", {})
+    if "dsh-notify" in deps:
+        deps.pop("dsh-notify", None)
+        if not deps:
+            data.pop("dependencies", None)
+        dir_name = os.path.dirname(p)
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, indent=2)
+            tf.write("\n")
+            temp_name = tf.name
+        os.replace(temp_name, p)
+except Exception as e:
+    sys.stderr.write(f"Failed to remove dsh-notify from package.json: {e}\n")
+PY
+      }
+
+      # 1) Link the plugin into the profile manifest atomically.
       "$PYTHON" - "$PROFILE_DIR/package.json" "$PLUGIN_DIR" <<'PY'
-import json, sys
+import json, os, sys, tempfile
 manifest, plugin_dir = sys.argv[1], sys.argv[2]
-with open(manifest) as f:
+with open(manifest, "r", encoding="utf-8") as f:
     data = json.load(f)
 data.setdefault("dependencies", {})["dsh-notify"] = f"link:{plugin_dir}"
-with open(manifest, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+dir_name = os.path.dirname(manifest)
+with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+    json.dump(data, tf, indent=2)
+    tf.write("\n")
+    temp_name = tf.name
+os.replace(temp_name, manifest)
 print("  package.json updated")
 PY
 
@@ -351,13 +379,76 @@ entry = (
 )
 open(p, "w").write(entry + ("\n" + body + "\n" if body else ""))
 PY
-        # Validate the result; roll back if we broke it.
-        if "$PYTHON" -c "import yaml,sys; yaml.safe_load(open('$PATCH').read())" 2>/dev/null; then
-          :  # unused branch kept for clarity
+        # Validate the result using safe standard-library or non-PyYAML parser; roll back if we broke it.
+        if "$PYTHON" - "$PATCH" <<'PY'
+import sys
+p = sys.argv[1]
+
+# Try PyYAML if present
+try:
+    import yaml
+    with open(p, "r", encoding="utf-8") as f:
+        yaml.safe_load(f)
+    sys.exit(0)
+except ImportError:
+    pass
+except Exception:
+    sys.exit(1)
+
+# Safe standard-library YAML structure validator
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    lines = text.splitlines()
+    in_single = False
+    in_double = False
+    escape = False
+    stack = []
+
+    for idx, line in enumerate(lines, 1):
+        indent = len(line) - len(line.lstrip(" "))
+        if "\t" in line[:indent]:
+            sys.exit(1)
+
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+
+        for ch in line:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch in "([{":
+                    stack.append(ch)
+                elif ch in ")]}":
+                    if not stack:
+                        sys.exit(1)
+                    top = stack.pop()
+                    if (top == "(" and ch != ")") or (top == "[" and ch != "]") or (top == "{" and ch != "}"):
+                        sys.exit(1)
+
+    if in_single or in_double or stack:
+        sys.exit(1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+        then
+          :  # valid YAML
         else
           LATEST_BAK="$(ls -t "$PATCH".bak.* 2>/dev/null | head -n1)"
           [ -n "$LATEST_BAK" ] && cp "$LATEST_BAK" "$PATCH"
-          say "! invalid YAML generated; restored the previous cordis.patch.yml"
+          remove_plugin_from_manifest
+          say "! invalid YAML generated; restored cordis.patch.yml and rolled back package.json"
           PLUGIN_DEPS_OK=0
         fi
       else
@@ -370,17 +461,7 @@ PY
           say "plugin imports cleanly"
         else
           say "! plugin does not import; removing it from the profile"
-          "$PYTHON" - "$PROFILE_DIR/package.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-data = json.load(open(p))
-deps = data.get("dependencies", {})
-deps.pop("dsh-notify", None)
-if not deps:
-    data.pop("dependencies", None)
-with open(p, "w") as f:
-    json.dump(data, f, indent=2); f.write("\n")
-PY
+          remove_plugin_from_manifest
           say "  Profile restored. Check: cd $PLUGIN_DIR && pnpm install"
         fi
       fi
