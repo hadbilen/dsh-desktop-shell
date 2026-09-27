@@ -1,13 +1,19 @@
 # Changelog
 
+## 0.1.0 - 2026-09-27
+
+### Added
+- **Tray Tailscale Remote Access Management:** Added checkable `Remote access (Tailscale)` action directly in the system tray menu to toggle `dsh-proxy.service` on and off on demand, eliminating the need to use the terminal.
+- **One-Click Remote Link Copy:** Added `Copy remote link` action in the tray menu. Automatically generates a cryptographically secure token, detects the active Tailscale IP (`tailscale ip -4`), copies the full authentication link (`http://<tailscale-ip>:3000/?token=...`) to clipboard, and delivers desktop notifications.
+- **Startup New Chat Mode:** By default (`DSH_NEW_CHAT=1`), launching the shell automatically opens a fresh, blank session ready for prompt input while retaining previous sessions in the sidebar. Configurable via `DSH_NEW_CHAT=0`, `--new-chat`, or `--resume`.
+- **Node.js V8 Engine Validation:** Added defensive verification in `install.sh` (`process.versions.v8`) to detect and reject Bun or non-V8 runtimes masquerading as `node`, preventing recursive service crash loops.
+
 ## 0.0.2 - 2026-09-27
 
 ### Added
 - **In-App One-Click Update Tooling:** The update check dialog in `dsh-tray.py` now provides an interactive "Apply Update" action with confirmation prompt, executing `dsh-update apply` via a subprocess with live output log streaming and auto-reloading the UI upon success.
 - **Single-Instance IPC Management:** Implemented `QLocalServer`/`QLocalSocket` IPC (`dsh-tray-ipc`) so subsequent launcher invocations (`dsh-desktop-launch.sh` or `--update`) seamlessly restore and focus the active window and trigger update checks without duplicate processes.
 - **Desktop Notification Action Integration:** Enhanced `dsh-update.py notify` to include a clickable "View Update" action (`notify-send -A`), allowing users to jump directly from a system update notification into the in-app update dialog.
-- **Startup New Chat Mode:** By default (`DSH_NEW_CHAT=1`), launching the shell automatically starts with a clean, blank session ready for prompt input while retaining previous sessions in the sidebar. Configurable via `DSH_NEW_CHAT=0`, `--new-chat`, or `--resume`.
-- **Node.js V8 Engine Validation:** Added defensive verification in `install.sh` (`process.versions.v8`) to detect and reject Bun or non-V8 runtimes masquerading as `node`, preventing recursive service crash loops.
 
 ## 0.0.1 - 2026-09-27
 

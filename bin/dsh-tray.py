@@ -26,6 +26,7 @@ import fcntl
 import http.client
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -63,6 +64,10 @@ REBOOTSTRAP_DAYS = 25  # DSH cookie lasts 30 days; safety margin
 UPDATE_BIN = Path.home() / ".local/bin/dsh-update"
 UPDATE_PY = Path.home() / ".local/bin/dsh-update.py"
 CHECK_TIMEOUT = 180  # seconds; the tray must not wait forever when there is no network
+
+CONFIG_DIR = Path.home() / ".config/dsh"
+PROXY_ENV = CONFIG_DIR / "proxy.env"
+PROXY_SERVICE = "dsh-proxy.service"
 
 # Startup window mode: "maximized" (default), "fullscreen" or "normal".
 # To change it, edit the DSH_TRAY_WINDOW line in
@@ -188,6 +193,90 @@ def target_url() -> str:
     )
     return f"{URL}/"
 
+
+def get_tailscale_ip() -> str | None:
+    """Get active IPv4 address from tailscale daemon, or None if unavailable."""
+    try:
+        r = subprocess.run(["tailscale", "ip", "-4"],
+                           capture_output=True, text=True, timeout=2.0)
+        if r.returncode == 0:
+            lines = r.stdout.strip().splitlines()
+            if lines and lines[0] and not lines[0].startswith("127."):
+                return lines[0].strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_proxy_config() -> tuple[str | None, str, int]:
+    """Read (token, bind_addr, port) from proxy.env if present."""
+    token: str | None = None
+    bind = os.environ.get("DSH_PROXY_BIND", "127.0.0.1")
+    port = int(os.environ.get("DSH_PROXY_PORT", "3000"))
+
+    if PROXY_ENV.is_file():
+        try:
+            for line in PROXY_ENV.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if k == "DSH_PROXY_TOKEN":
+                    token = v
+                elif k == "DSH_PROXY_BIND":
+                    bind = v
+                elif k == "DSH_PROXY_PORT" and v.isdigit():
+                    port = int(v)
+        except Exception:
+            pass
+    return token, bind, port
+
+
+def ensure_proxy_config() -> tuple[str, str, int]:
+    """Ensure proxy.env has a secure token and the best available bind address."""
+    token, bind, port = get_proxy_config()
+    ts_ip = get_tailscale_ip()
+
+    if ts_ip and (bind == "127.0.0.1" or not bind):
+        bind = ts_ip
+
+    if not token:
+        token = secrets.token_urlsafe(32)
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"# DeepSeek Harness remote-access proxy configuration\n"
+        f"DSH_PROXY_TOKEN={token}\n"
+        f"DSH_PROXY_BIND={bind}\n"
+        f"DSH_PROXY_PORT={port}\n"
+    )
+    PROXY_ENV.write_text(content)
+    try:
+        PROXY_ENV.chmod(0o600)
+    except OSError:
+        pass
+
+    return token, bind, port
+
+
+def is_proxy_active() -> bool:
+    """Return True if dsh-proxy.service is active."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", PROXY_SERVICE],
+                           capture_output=True, text=True, timeout=2.0)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def get_remote_url() -> str | None:
+    """Build the full remote URL with token if configured."""
+    token, bind, port = get_proxy_config()
+    if not token:
+        return None
+    return f"http://{bind}:{port}/?token={token}"
 
 
 def update_command() -> list[str]:
@@ -736,8 +825,85 @@ def main() -> int:
     act_quit = QAction("Quit shell (service keeps running)", menu)
     act_quit.triggered.connect(real_quit)
 
+    # Tailscale Remote Access Toggle & Link Copy
+    act_proxy = QAction("Remote access (Tailscale)", menu)
+    act_proxy.setCheckable(True)
+    act_copy_url = QAction("Copy remote link", menu)
+
+    def on_copy_url() -> None:
+        url = get_remote_url()
+        if url:
+            cb = QGuiApplication.clipboard()
+            if cb:
+                cb.setText(url)
+            tray.showMessage(
+                "Remote Access",
+                f"Link copied to clipboard:\n{url}",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+        else:
+            tray.showMessage(
+                "Remote Access",
+                "Proxy token is not configured yet.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                3000,
+            )
+
+    act_copy_url.triggered.connect(on_copy_url)
+
+    def on_toggle_proxy() -> None:
+        if is_proxy_active():
+            subprocess.run(["systemctl", "--user", "stop", PROXY_SERVICE],
+                           capture_output=True)
+            act_proxy.setChecked(False)
+            act_copy_url.setEnabled(False)
+            tray.showMessage(
+                "Remote Access Disabled",
+                "dsh-proxy stopped. DSH is now loopback-only.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+        else:
+            token, bind, port = ensure_proxy_config()
+            subprocess.run(["systemctl", "--user", "start", PROXY_SERVICE],
+                           capture_output=True)
+            active = is_proxy_active()
+            act_proxy.setChecked(active)
+            act_copy_url.setEnabled(active)
+            if active:
+                url = f"http://{bind}:{port}/?token={token}"
+                cb = QGuiApplication.clipboard()
+                if cb:
+                    cb.setText(url)
+                tray.showMessage(
+                    "Remote Access Enabled",
+                    f"Listening on {bind}:{port}\nLink copied to clipboard!",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    5000,
+                )
+            else:
+                tray.showMessage(
+                    "Remote Access Error",
+                    "Could not start dsh-proxy.service. Check journalctl.",
+                    QSystemTrayIcon.MessageIcon.Critical,
+                    4000,
+                )
+
+    act_proxy.triggered.connect(on_toggle_proxy)
+
+    def update_menu_states() -> None:
+        proxy_up = is_proxy_active()
+        act_proxy.setChecked(proxy_up)
+        act_copy_url.setEnabled(proxy_up)
+
+    menu.aboutToShow.connect(update_menu_states)
+
     for a in (act_toggle, act_reload, act_status):
         menu.addAction(a)
+    menu.addSeparator()
+    menu.addAction(act_proxy)
+    menu.addAction(act_copy_url)
     menu.addSeparator()
     menu.addAction(act_update)
     menu.addSeparator()

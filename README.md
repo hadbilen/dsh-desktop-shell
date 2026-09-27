@@ -16,12 +16,13 @@ application on Linux:
 |---|---|
 | **Desktop shortcut** | A launcher entry with icon — no terminal needed |
 | **Tray shell** | QtWebEngine window; closing it (X) hides to the tray instead of quitting |
-| **Tray menu** | Show/hide, reload, service status, in-app update check & apply, real quit |
+| **Tray menu** | Show/hide, reload, service status, in-app updates, Tailscale remote toggle & link copy, real quit |
+| **Startup new chat** | Automatically opens directly into a clean prompt session (`DSH_NEW_CHAT=1`) with autofocus |
 | **systemd service** | `dsh-web.service` keeps DSH running independently of any window |
 | **Desktop notifications** | System notifications for turn, question, and error events |
 | **In-app updates** | One-click update check and apply directly from the GUI or notification, with live log stream and auto-reload |
 | **Update CLI** | `dsh-update` — npm + GitHub release channels, automatic backup & rollback, version cleanup |
-| **Optional remote access** | Authenticated reverse proxy for Tailscale-style private networks |
+| **Tailscale remote access** | On-demand authenticated reverse proxy with one-click tray toggle and link sharing |
 
 ### Desktop notifications
 
@@ -131,8 +132,16 @@ No terminal is required to check or install updates:
 `bin/dsh-tailscale-proxy.mjs` exposes the loopback-only DSH UI over a private
 network such as Tailscale.
 
-**It is off by default and refuses to bind beyond loopback without a token.**
-To enable it:
+### Managing remote access from the tray
+
+No manual terminal configuration is needed:
+1. Open the tray menu and check **Remote access (Tailscale)**.
+2. If `~/.config/dsh/proxy.env` does not exist yet, a secure 32-byte token is automatically generated and bound to your active Tailscale IP (`tailscale ip -4`).
+3. The ready-to-use URL (`http://<tailscale-ip>:3000/?token=...`) is automatically copied to your clipboard.
+4. Click **Copy remote link** in the tray menu anytime you need the link on your phone or remote browser.
+5. Unchecking the option immediately stops `dsh-proxy.service` and returns DSH to loopback-only isolation.
+
+### Manual terminal configuration (alternative)
 
 ```bash
 mkdir -p ~/.config/dsh
