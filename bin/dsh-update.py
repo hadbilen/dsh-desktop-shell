@@ -26,6 +26,12 @@ Why the service must be stopped:
   hash-named assets were deleted, an open page gets a 404 while the new client
   talks to the old server. Besides, the service is the running agent sessions
   themselves: DSH goes down while this command runs.
+
+Diagnostics:
+  Every apply/prune/full run mirrors its output into
+  ~/.cache/dsh-update/logs/<command>-<stamp>.log (the newest five are kept), and
+  the complete `bun` output is captured there. `check` prints the newest log path
+  and warns when an earlier run left a tree backup behind.
 """
 
 from __future__ import annotations
@@ -98,13 +104,20 @@ def is_rc(v: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def deep_scan(roots: tuple[Path, ...]) -> dict[str, int]:
-    """Counts all dsh package copies in the given trees, grouped by version.
+    """Counts DSH package files in the given trees, grouped by version.
 
-    Copies that point to the same file via symlink/hardlink are counted once,
-    so the profile tree (symlinks to the global tree) is not seen as a second copy.
+    One package counts ONCE PER FILE: entries that are the same file through a
+    symlink OR a hardlink are deduplicated. Bun hardlinks package files out of
+    its download cache, so the same `package.json` can sit at dozens of paths;
+    counting paths instead of files inflated a real report roughly fivefold
+    (379 paths, 71 files), which made the tool look like it had found far more
+    leftovers than actually existed.
+
+    `f.stat()` (not `lstat`) follows symlinks, so the profile tree — which is
+    symlinks into the global tree — is not counted as a second copy either.
     """
     counts: dict[str, int] = {}
-    seen: set[str] = set()
+    seen: set[tuple[int, int]] = set()
     for root in roots:
         base = root / "@deepseek-ai"
         if not base.is_dir():
@@ -114,10 +127,11 @@ def deep_scan(roots: tuple[Path, ...]) -> dict[str, int]:
             if name != "dsh" and not name.startswith("dsh-"):
                 continue
             try:
-                real = str(f.resolve())
-                if real in seen:
+                st = f.stat()
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
                     continue
-                seen.add(real)
+                seen.add(key)
                 v = json.loads(f.read_text())["version"]
             except Exception:
                 continue
@@ -157,6 +171,44 @@ def cache_entries() -> list[tuple[str, str, Path]]:
     return out
 
 
+def rmtree_verified(path: Path) -> bool:
+    """Delete a directory tree and CONFIRM that it is really gone.
+
+    `shutil.rmtree(..., ignore_errors=True)` is not enough on its own: a
+    directory that lacks the owner's write bit makes rmtree fail on its children
+    and it returns silently, leaving the tree in place. A silent failure here is
+    the worst possible outcome for an updater, because the `bun add` that follows
+    then installs on top of the old packages and the machine ends up holding two
+    versions — exactly the state this tool exists to prevent.
+
+    Strategy: delete, then (only if something survived) make every directory
+    writable and delete again, then report the truth to the caller.
+
+    @param path - the tree to remove.
+    @returns True when the path no longer exists.
+    """
+    if not path.exists() and not path.is_symlink():
+        return True
+
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        return True
+
+    # Retry: rmtree cannot unlink entries from a directory the owner cannot write.
+    for root, dirs, _files in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o700)
+            except OSError:
+                pass
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
+
+
 def remove_cache_entry(path: Path) -> int:
     """ACTUALLY deletes a single cache entry; returns the bytes freed.
 
@@ -183,9 +235,8 @@ def remove_cache_entry(path: Path) -> int:
     if not path.exists():
         return 0
     size = dir_size(path)
-    shutil.rmtree(path, ignore_errors=True)
-    # rmtree uses ignore_errors=True; verify that it really went away.
-    return 0 if path.exists() else size
+    # Verified delete: a read-only subdirectory must not look like a success.
+    return size if rmtree_verified(path) else 0
 
 
 def dir_size(path: Path) -> int:
@@ -349,13 +400,8 @@ def newest_installable(data: dict) -> str | None:
         return None
 
     newest = max(candidates, key=vkey)
-    if rc is None or newest == rc:
-        return newest
-
-    # In the same core version, stable supersedes the rc (0.1.7 > 0.1.7-rc.2).
-    core = lambda v: v.split("+")[0].partition("-")[0]  # noqa: E731
-    if core(newest) == core(rc):
-        return newest
+    # A stable release sorts above its own rc (see `vkey`), so "the newest wins"
+    # already implements "within one core, stable supersedes the rc".
     return newest
 
 
@@ -489,6 +535,114 @@ def wait_service(seconds: int = 90) -> bool:
     return False
 
 
+def service_down(timeout: float = 10.0) -> bool:
+    """Wait until the DSH web service stops answering.
+
+    Used after `systemctl stop`: the tree must never be replaced under a server
+    that is still running (an open page would then mix old and new assets).
+    A service that was not running at all also counts as down, so this does not
+    turn "nothing to stop" into an error.
+
+    @param timeout - how long to wait for the port to go quiet.
+    @returns True when the service no longer answers.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not service_up():
+            return True
+        time.sleep(0.5)
+    return not service_up()
+
+
+# --------------------------------------------------------------------------- #
+# run log
+#
+# A destructive run must leave a trace. Before v0.0.5 the installer output went
+# to the terminal only, so a failed update could not be diagnosed afterwards
+# (the only surviving evidence was rollback.json). Every apply/prune/full run now
+# mirrors stdout+stderr into ~/.cache/dsh-update/logs/<command>-<stamp>.log and
+# keeps the newest few.
+# --------------------------------------------------------------------------- #
+
+LOG_DIR = STATE_DIR / "logs"
+LOG_KEEP = 5
+_LOG_HANDLE = None
+
+
+class _Tee:
+    """Minimal stream duplicator: writes to the console AND the log file."""
+
+    def __init__(self, *streams) -> None:
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _prune_logs() -> None:
+    """Keep only the newest LOG_KEEP logs."""
+    try:
+        logs = sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in logs[LOG_KEEP:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def start_log(command: str, header: str = "") -> Path | None:
+    """Mirror stdout/stderr into a timestamped log file.
+
+    @param command - subcommand name, used in the file name.
+    @param header - extra first lines (version, target) for context.
+    @returns the log path, or None when logging is not possible.
+    """
+    global _LOG_HANDLE
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = LOG_DIR / f"{command}-{stamp}.log"
+        handle = open(path, "a", encoding="utf-8")
+        handle.write(f"# dsh-update {command} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        if header:
+            handle.write(f"# {header}\n")
+        handle.flush()
+        _LOG_HANDLE = handle
+        sys.stdout = _Tee(sys.__stdout__, handle)
+        sys.stderr = _Tee(sys.__stderr__, handle)
+        _prune_logs()
+        return path
+    except Exception:
+        return None
+
+
+def log_raw(text: str) -> None:
+    """Write text to the log file only (for output that is too long to print)."""
+    if _LOG_HANDLE is None:
+        return
+    try:
+        _LOG_HANDLE.write(text)
+        if not text.endswith("\n"):
+            _LOG_HANDLE.write("\n")
+        _LOG_HANDLE.flush()
+    except Exception:
+        pass
+
+
 def human(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
@@ -620,10 +774,17 @@ def cmd_check() -> int:
     if st["versions"]:
         for v, n in sorted(st["versions"].items(), key=lambda kv: vkey(kv[0])):
             tag = "  ← in use" if v == st["installed"] else "  ← UNWANTED"
-            print(f"    {v:16s} {n} package copies{tag}")
+            print(f"    {v:16s} {n} package files{tag}")
     if st["dangling"]:
         print(f"  dangling symlinks: {len(st['dangling'])} (profile tree)")
     print(f"  download cache   : {len(st['cache'])} entries, {human(st['cache_size'])}")
+    logs = (sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
+            if LOG_DIR.is_dir() else [])
+    if logs:
+        print(f"  last run log     : {logs[-1]}")
+    backup = STATE_DIR / "tree-backup"
+    if backup.is_dir():
+        print(f"  unfinished update: backup still on disk ({human(dir_size(backup))})")
     others = find_other_installs()
     if others:
         print("  other DSH assets (outside the main trees):")
@@ -671,10 +832,13 @@ def cmd_check() -> int:
                             f"it cannot be installed until the package is published (newest rc: {rc})")
     if st["other_versions"]:
         total = sum(st["other_versions"].values())
-        problems.append(f"Other versions are on disk: {total} package copies "
+        problems.append(f"Other versions are on disk: {total} package files "
                         f"({', '.join(sorted(st['other_versions']))})")
     if st["dangling"]:
         problems.append(f"there are {len(st['dangling'])} dangling profile symlinks")
+    if backup.is_dir():
+        problems.append(f"a previous update did not finish: its backup is still on disk "
+                        f"({human(dir_size(backup))}); the next apply replaces and removes it")
     if others:
         problems.append(f"{len(others)} DSH assets sit outside the main trees "
                         f"(see above; dsh-update extras)")
@@ -786,7 +950,7 @@ def cmd_notify() -> int:
 
     extra = ""
     if st["other_versions"]:
-        extra = (f"\nThere are also {sum(st['other_versions'].values())} unwanted package copies on disk; "
+        extra = (f"\nThere are also {sum(st['other_versions'].values())} unwanted package files on disk; "
                  f"the update deletes them.")
     body = (f"Installed: {installed}\nNewest rc: {rc}{extra}\n\n"
             f"Click 'View Update' to inspect and apply within DeepSeek Harness,\n"
@@ -888,14 +1052,15 @@ def _backup_tree() -> Path | None:
     if not src.is_dir():
         return None
     dest = STATE_DIR / "tree-backup"
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
+    if dest.exists() and not rmtree_verified(dest):
+        print(f"      ! the stale backup at {dest} could not be removed.", file=sys.stderr)
+        return None
     try:
         # Try hardlinks first: nearly free on the same filesystem.
         shutil.copytree(src, dest, symlinks=True,
                         copy_function=os.link)
     except (OSError, shutil.Error):
-        shutil.rmtree(dest, ignore_errors=True)
+        rmtree_verified(dest)
         try:
             shutil.copytree(src, dest, symlinks=True)
         except (OSError, shutil.Error) as e:
@@ -908,7 +1073,11 @@ def _restore_tree(backup: Path) -> bool:
     """Restores the @deepseek-ai tree from the backup."""
     dest = GLOBAL_NM / "@deepseek-ai"
     try:
-        shutil.rmtree(dest, ignore_errors=True)
+        # A silent failure here would make the copy below raise FileExistsError
+        # and hide the real reason, so the delete is verified first.
+        if not rmtree_verified(dest):
+            print(f"      ! {dest} could not be cleared before the restore", file=sys.stderr)
+            return False
         if backup.is_dir():
             # Copy the hardlinked backup back (so the backup is not corrupted).
             shutil.copytree(backup, dest, symlinks=True,
@@ -963,6 +1132,12 @@ def cache_version_matches(ver: str, target: str, path: Path | None = None) -> bo
     directory is given, the real version is read from `package.json`; otherwise
     it falls back to a cautious prefix comparison on the string.
 
+    Only the exact target version is kept. Older builds of the same core
+    (`0.2.0-rc.1` while the target is `0.2.0-rc.2`) are deleted like any other
+    stale entry: keeping them contradicted what `plan` promises and left the
+    download cache growing with every release. The cache is only a download
+    cache — a re-download restores anything that is needed later.
+
     @param ver - the version string extracted from the cache directory name.
     @param target - the version to keep (e.g. "0.1.7-rc.2").
     @param path - the entry directory (if present, the real version is read from here).
@@ -978,15 +1153,7 @@ def cache_version_matches(ver: str, target: str, path: Path | None = None) -> bo
         except Exception:
             real = None
         if isinstance(real, str) and real:
-            if real == target:
-                return True
-            # The directory name carries the core of the real version (0.1.7-...).
-            # If the core matches and the real version differs, this entry is
-            # ANOTHER build of the target; still, keeping old entries of the
-            # same core prevents data loss.
-            core_target = target.split("+")[0].partition("-")[0]
-            core_real = real.split("+")[0].partition("-")[0]
-            return core_real == core_target
+            return real == target
 
     # 2) package.json could not be read: cautious comparison on the string.
     core_target = target.split("+")[0].partition("-")[0]
@@ -1048,7 +1215,7 @@ def _verify(target: str, strict: bool) -> bool:
     if st["versions"]:
         for v, n in sorted(st["versions"].items(), key=lambda kv: vkey(kv[0])):
             if v != target:
-                print(f"      ! still another version: {v} ({n} copies)")
+                print(f"      ! still another version: {v} ({n} files)")
                 ok = False
     if st["dangling"]:
         print(f"      ! {len(st['dangling'])} dangling symlinks remain")
@@ -1074,10 +1241,18 @@ def _run_apply(target: str, mode: str, with_extras: bool = False,
               file=sys.stderr)
         return 1
 
+    log_path = start_log(mode, f"installed={st['installed']} target={target} mode={mode}")
+    if log_path is not None:
+        print(f"Run log: {log_path}")
+
     saved = _backup()
     dropped = _drop_extra_deps() if with_extras else []
 
     print("\n[0/6] backing up the tree…")
+    stale = STATE_DIR / "tree-backup"
+    if stale.is_dir():
+        print(f"      note: a previous run left a backup ({human(dir_size(stale))}); "
+              f"it is replaced now")
     tree_backup = _backup_tree()
     if tree_backup is None:
         print("      ! The tree could not be backed up; not proceeding to the destructive step.", file=sys.stderr)
@@ -1092,17 +1267,41 @@ def _run_apply(target: str, mode: str, with_extras: bool = False,
 
     print(f"\n[1/6] stopping {SERVICE}…")
     r = systemctl("stop", SERVICE)
-    print("      " + (r.stdout + r.stderr).strip())
+    stop_out = (r.stdout + r.stderr).strip()
+    if stop_out:
+        print("      " + stop_out)
+    # The return code alone is not decisive (stopping an inactive unit is not an
+    # error), so the service is asked directly. Replacing the tree under a server
+    # that is still serving would leave open pages mixing old and new assets.
+    if not service_down():
+        print(f"      ! {SERVICE} is still answering on {URL}.", file=sys.stderr)
+        print("        The package tree was NOT touched.", file=sys.stderr)
+        print(f"        Stop it and retry: systemctl --user stop {SERVICE}", file=sys.stderr)
+        return 1
 
     print("[2/6] deleting the old tree…")
-    shutil.rmtree(GLOBAL_NM / "@deepseek-ai", ignore_errors=True)
+    if not rmtree_verified(GLOBAL_NM / "@deepseek-ai"):
+        print("      ! the old tree could not be fully deleted.", file=sys.stderr)
+        print("        Restoring the previous tree from the backup…", file=sys.stderr)
+        if _restore_tree(tree_backup):
+            print("        previous tree restored; nothing was installed.", file=sys.stderr)
+        else:
+            print(f"        Manual: cp -a {tree_backup} {GLOBAL_NM}/@deepseek-ai", file=sys.stderr)
+        systemctl("start", SERVICE)
+        return 1
     (GLOBAL / "bun.lock").unlink(missing_ok=True)
 
     print(f"[3/6] installing: {PKG}@{target}")
     r = subprocess.run([str(BUN), "add", "--global", f"{PKG}@{target}"],
                        capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
-    print("      " + out[-1200:])
+    # The full output goes to the run log; the terminal only needs the tail.
+    log_raw(f"\n--- bun add --global {PKG}@{target} (exit {r.returncode}) ---\n{out}\n")
+    if len(out) > 1200:
+        print("      " + out[-1200:])
+        print("      (full bun output is in the run log)")
+    else:
+        print("      " + out)
     if r.returncode != 0:
         print("\n      INSTALLATION FAILED — automatic rollback will be attempted.", file=sys.stderr)
         # Automatic rollback: do not leave the user to type commands by hand.
@@ -1176,11 +1375,23 @@ def _run_apply(target: str, mode: str, with_extras: bool = False,
     # Successful installation: drop the temporary tree backup (disk space).
     # If the service is up, no rollback is needed; it can be kept with `--keep-backup`.
     if tree_backup is not None and tree_backup.is_dir() and not keep_backup:
-        shutil.rmtree(tree_backup, ignore_errors=True)
-        print(f"      temporary backup deleted: {tree_backup}")
+        if rmtree_verified(tree_backup):
+            print(f"      temporary backup deleted: {tree_backup}")
+        else:
+            print(f"      ! the temporary backup could not be deleted "
+                  f"({human(dir_size(tree_backup))}): {tree_backup}", file=sys.stderr)
+            print(f"        Remove it manually: rm -rf {tree_backup}", file=sys.stderr)
 
-    print("\nDone." if ok else "\nDone (some leftovers remain; take a look with check).")
+    if ok:
+        print("\nDone.")
+    else:
+        # Exit code 2 means the new version IS installed and only leftover
+        # package copies remain; the GUI reports this as a warning, not a failure.
+        print("\nDone: the new version is installed, but some leftovers remain.")
+        print("Run 'dsh-update check' to see them; the next apply removes them.")
     print("Refresh the clients: 'Refresh' in the DSH shell, reload the page in the browser.")
+    if log_path is not None:
+        print(f"Full log: {log_path}")
     return 0 if ok else 2
 
 

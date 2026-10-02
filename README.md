@@ -17,7 +17,7 @@ application on Linux:
 | **Desktop shortcut** | A launcher entry with icon — no terminal needed |
 | **Tray shell** | QtWebEngine window; closing it (X) hides to the tray instead of quitting |
 | **Tray menu** | Show/hide, reload, service status, in-app updates, Tailscale remote toggle & link copy, real quit |
-| **Startup new chat** | Automatically opens directly into a clean prompt session (`DSH_NEW_CHAT=1`) with autofocus |
+| **Session restore** | The shortcut reopens the last session; `DSH_NEW_CHAT=1` (or `--new-chat`) starts a clean prompt session with autofocus instead |
 | **systemd service** | `dsh-web.service` keeps DSH running independently of any window |
 | **Desktop notifications** | System notifications for turn, question, and error events |
 | **In-app updates** | One-click update check and apply directly from the GUI or notification, with live log stream and auto-reload |
@@ -36,7 +36,11 @@ Notifications are suppressed while the window is focused, and subagent
 sessions are excluded by default so a long task does not spam you. Clicking a
 notification brings the window to the front.
 
-Settings live in the DSH settings document under the `notify` namespace:
+The toggles are edited on the **General settings page**, in a **Notifications** row
+with one switch per preference. (DSH 0.2 renders no generic form for a plugin
+namespace, so the plugin draws its own row — the same way DSH's own Appearance and
+session-log rows work.) A change takes effect immediately, without reloading the page.
+Until a value is stored, the default below stays in force:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -46,6 +50,14 @@ Settings live in the DSH settings document under the `notify` namespace:
 | `onlyWhenHidden` | `true` | Stay quiet while the window is focused |
 | `includeSubagents` | `false` | Also notify for subagent sessions |
 | `sound` | `false` | Play the system notification sound |
+
+Stored values live in the profile patch
+(`~/.dsh/profiles/web/cordis.patch.yml`) as the entry's `config:` block — in DSH 0.2
+that file *is* the settings document. Editing it by hand works but needs a service
+restart; the settings row applies changes live. Settings are persisted per profile
+while the page is served over loopback: a browser that reaches DSH through the optional
+Tailscale proxy gets a memory-only settings scope, so changes made from a remote device
+are not written to the profile.
 
 ---
 
@@ -57,6 +69,8 @@ Settings live in the DSH settings document under the `notify` namespace:
 - **Optional but recommended:** `python3-pyqt6.qtwebengine` for the tray shell.
   Without it the launcher falls back to a plain browser app window.
 - **Optional:** `pnpm` — needed only for the notification plugin and `dsh plugin`
+- **Optional:** `curl` — only the browser-window fallback (`dsh-app-window.sh`) uses
+  it to probe the service before opening a window; the tray shell does not need it
 
 ```bash
 sudo apt install python3-pyqt6.qtwebengine
@@ -83,8 +97,10 @@ Useful flags:
 | `--with-proxy` | Also enable the remote-access proxy (generates a token) |
 
 The installer copies files into XDG directories, fills the systemd unit
-templates with your real paths, enables the services, and links the
-notification plugin into your `web` profile.
+templates with your real paths, enables the services, and links the notification
+plugin into your `web` profile — including installing the profile's dependency
+tree (`dsh plugin --profile web install`), which is what actually materializes the
+link, and validating the profile patch it edits.
 
 ### Uninstall
 
@@ -94,7 +110,12 @@ notification plugin into your `web` profile.
 ./uninstall.sh --keep-plugin
 ```
 
-Neither touches your DSH versions, sessions, or profiles.
+Neither touches your DSH versions, sessions, or DSH profiles. `--purge` does
+additionally remove this project's own state: the update logs and backups
+(`~/.cache/dsh-update`), the proxy token (`~/.config/dsh/proxy.env`), and the two
+browser profiles the shell creates (`~/.local/share/dsh-tray`,
+`~/.local/share/dsh-app`) — removing those logs the web UI out, so you will have
+to authenticate once on the next launch.
 
 ---
 
@@ -117,6 +138,15 @@ leaves you without DSH.
 
 The friendly default is a `systemd --user` timer that checks twice a day and
 notifies you when a new version exists.
+
+Exit codes of `apply`: `0` = installed and clean, `2` = installed but leftover
+package copies remain (a warning), `1` = failed (the previous version was restored).
+
+Every `apply`, `prune` and `full` run writes a full log to
+`~/.cache/dsh-update/logs/<command>-<timestamp>.log` (the newest five are kept,
+including the complete `bun` output). `dsh-update check` prints the newest log
+path and warns when a previous run left a backup behind — that is the first thing
+to look at when an update did not go as expected.
 
 ### In-app updates
 
@@ -166,6 +196,7 @@ Then visit `http://<tailscale-ip>:3000/?token=<your-token>`.
 
 ```
 bin/            scripts installed to ~/.local/bin
+bin/dsh-yaml-check.py   profile patch validator used by both installers (not installed)
 units/          systemd user unit templates (filled in by install.sh)
 applications/   .desktop entries
 icons/          app icon (png + svg + hicolor sizes)
@@ -194,7 +225,7 @@ All scripts read environment variables; nothing hardcodes a username.
 |---|---|---|
 | `DSH_WEB_URL` | tray, browser window, proxy, updater | `http://127.0.0.1:3080` |
 | `DSH_TRAY_WINDOW` | tray launcher | `maximized` (`fullscreen`/`normal`) |
-| `DSH_NEW_CHAT` | tray launcher | `1` (clean new chat) / `0` (restore last) |
+| `DSH_NEW_CHAT` | tray launcher | `0` (default: restore the last session) / `1` (clean new chat) |
 | `DSH_CHROME` | browser window fallback | auto-detected (Chrome, Chromium, Brave, Edge) |
 | `DSH_NODE` | launcher, installer | auto-detected |
 | `DSH_BIN` | launcher, installer | auto-detected |
@@ -280,10 +311,33 @@ instead of failing silently.
 3. Restart DSH after installing the plugin — the client roster is built at boot.
 4. Subagent-only activity does not notify by default (`includeSubagents`).
 
+**The Notifications row is missing from the General settings page**
+The client bundle is fetched when the page loads, so reload the interface first —
+close and reopen the window or tab (in the tray shell the *Reload* menu item does the
+same). If a plugin update still does not arrive, clear the shell's HTTP cache; the
+session cookies live in `profile/` and stay untouched:
+
+```bash
+pkill -f dsh-tray.py; sleep 1; rm -rf ~/.local/share/dsh-tray/cache
+```
+
+If the row is there but its switches are disabled, the row says why: the settings
+document is still loading, or the deployment does not serve the `notify` namespace —
+`dsh --profile web --dump-config | grep -A5 notify` then shows whether the entry is
+composed at all.
+
 **Update check says "up to date" but a release exists**
 The tool tracks rc releases and also picks up newer stable releases. If only a
 GitHub release exists and npm has not published it yet, there is nothing
 installable — `dsh-update check` says so explicitly.
+
+**An update failed, or "leftovers remain"**
+Every `apply`/`prune`/`full` run writes a log to `~/.cache/dsh-update/logs/`;
+`dsh-update check` prints the newest one and warns when an aborted run left a
+backup behind (the next `apply` replaces and removes it). A failed run restores
+the previous version automatically and prints the manual rollback command at the
+end of the log. Leftovers (`exit code 2`) mean the new version is installed and
+only stale package files remain — `dsh-update apply` removes them.
 
 ---
 

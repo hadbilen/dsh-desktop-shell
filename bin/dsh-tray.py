@@ -7,8 +7,11 @@ Behaviour:
   - Tray menu: update check, reload, service status, really quit.
   - "Check for updates" looks at the official GitHub repo (dsh-update ghcheck);
     the check runs in the background, the window does not freeze and the result
-    is shown in a separate window. If a new version exists, installing it is
-    still manual: `dsh-update apply`.
+    is shown in a separate window. If a new version exists it can be installed
+    from that window ("Apply Update" -> `dsh-update apply --yes`), with live
+    output; the window reloads itself afterwards.
+    Exit codes: 0 = installed and clean, 2 = installed but leftover package
+    copies remain (a warning, not a failure), anything else = failed.
   - "Quit" only closes this shell; dsh-web.service (the agent) keeps running.
 
 Note: The DSH Web interface requires authentication on loopback. When a new
@@ -90,9 +93,10 @@ if WINDOW_MODE not in ("maximized", "fullscreen", "normal"):
           "using 'maximized'.", file=sys.stderr)
     WINDOW_MODE = "maximized"
 
-# Startup session mode: 1 / "true" starts with a clean new session; 0 / "false" restores last session.
+# Startup session mode: 0 / "false" (default) restores the last session, so the
+# shortcut continues where the user left off; 1 / "true" starts a clean new session.
 # Configurable via DSH_NEW_CHAT or CLI flags (--new-chat / --resume).
-NEW_CHAT_DEFAULT = os.environ.get("DSH_NEW_CHAT", "1").strip().lower() in ("1", "true", "yes", "on")
+NEW_CHAT_DEFAULT = os.environ.get("DSH_NEW_CHAT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Desktop environment, used only to produce a useful diagnostic. Nothing in
 # this script behaves differently per environment: the tray is probed at
@@ -502,9 +506,22 @@ class UpdateDialog(QDialog):
         self.proc = None
         self.btn_close.setEnabled(True)
 
-        if code == 0 and status == QProcess.ExitStatus.NormalExit:
-            self.view.appendPlainText("\n" + "=" * 60 + "\n✓ Update completed successfully!\n"
-                                     "Reloading interface in 3 seconds…\n" + "=" * 60)
+        # dsh-update distinguishes "installed and clean" (0) from "installed, but
+        # leftover package copies remain" (2). Both mean the new version IS in
+        # place, so both are reported as a completed update — treating 2 as a
+        # failure showed "Update failed" and a Retry button after a successful
+        # update, and skipped the reload.
+        if status == QProcess.ExitStatus.NormalExit and code in (0, 2):
+            if code == 2:
+                self.view.appendPlainText(
+                    "\n" + "=" * 60 + "\n"
+                    "! Update installed, but some leftover package copies remain.\n"
+                    "  Run 'dsh-update check' in a terminal to see them;\n"
+                    "  the next 'dsh-update apply' removes them.\n"
+                    "Reloading interface in 3 seconds…\n" + "=" * 60)
+            else:
+                self.view.appendPlainText("\n" + "=" * 60 + "\n✓ Update completed successfully!\n"
+                                         "Reloading interface in 3 seconds…\n" + "=" * 60)
             self.view.moveCursor(QTextCursor.MoveOperation.End)
             if self.btn_apply:
                 self.btn_apply.setText("Updated ✓")

@@ -47,6 +47,23 @@ step() { printf '\n== %s ==\n' "$*"; }
 run() {
   if [ "$DRY_RUN" = 1 ]; then say "[dry-run] $*"; else "$@"; fi
 }
+# Newest backup of a file, empty when there is none. The `|| true` is required:
+# under `set -o pipefail` a failing `ls` (no match) would otherwise make the
+# enclosing assignment abort the whole installer.
+latest_backup() {
+  ls -t "$1".bak.* 2>/dev/null | head -n1 || true
+}
+# Validate a profile patch. 0 = valid (or no validator available), 1 = broken.
+# A patch that does not parse is fatal for the whole profile, so both editors
+# check their own work with the same implementation.
+patch_is_valid() {
+  local checker="$REPO_DIR/bin/dsh-yaml-check.py"
+  if [ ! -f "$checker" ]; then
+    say "! YAML validator not found ($checker); skipping the check"
+    return 0
+  fi
+  "$PYTHON" "$checker" "$1"
+}
 
 # --------------------------------------------------------------------------- #
 # 0) Check prerequisites
@@ -109,6 +126,11 @@ if [ -z "$PYTHON" ]; then
   exit 1
 fi
 say "python3     : $PYTHON"
+
+# PATH for the package managers: pnpm's launcher and the profile's lifecycle
+# scripts need the node we resolved to be reachable, also in a clean desktop
+# session where PATH may not contain it.
+PNPM_PATH="$(dirname "$NODE"):$PATH"
 
 # Detect the desktop environment and session type. Nothing here changes which
 # code is installed -- the scripts are environment agnostic and probe the tray
@@ -293,10 +315,6 @@ if [ "$WITH_PLUGIN" = 1 ]; then
     # touched after this succeeds.
     PLUGIN_DEPS_OK=0
     if command -v pnpm >/dev/null 2>&1; then
-      # pnpm may need node on PATH (its native binary is not always installed).
-      # Pass the node we already resolved so the install works in a clean
-      # desktop session too.
-      PNPM_PATH="$(dirname "$NODE"):$PATH"
       if (cd "$PLUGIN_DIR" && PATH="$PNPM_PATH" pnpm install --silent 2>/dev/null); then
         PLUGIN_DEPS_OK=1
         say "plugin dependencies installed"
@@ -351,7 +369,36 @@ os.replace(temp_name, manifest)
 print("  package.json updated")
 PY
 
-      # 2) Add the insert block to cordis.patch.yml.
+      # 2) Materialize the link in the profile's node_modules.
+      #
+      # Writing package.json is NOT enough. DSH builds the profile dependency
+      # tree only when the profile is installed (`dsh plugin --profile <name>
+      # install`, a pnpm passthrough) and it does not do that at boot, so on a
+      # fresh profile the import check below would fail and this script would
+      # roll the plugin back for no reason. This step is also what replaces a
+      # leftover development symlink (a link into the git working tree) with the
+      # installed copy under $PLUGIN_INSTALL_DIR.
+      PROFILE_NAME="$(basename "$PROFILE_DIR")"
+      PROFILE_DEPS_OK=0
+      if [ -n "$DSH_BIN" ] && [ -f "$DSH_BIN" ]; then
+        if PATH="$PNPM_PATH" "$NODE" "$DSH_BIN" plugin --profile "$PROFILE_NAME" install \
+             >/dev/null 2>&1; then
+          PROFILE_DEPS_OK=1
+        fi
+      fi
+      if [ "$PROFILE_DEPS_OK" != 1 ] && command -v pnpm >/dev/null 2>&1; then
+        if (cd "$PROFILE_DIR" && PATH="$PNPM_PATH" pnpm install --silent >/dev/null 2>&1); then
+          PROFILE_DEPS_OK=1
+        fi
+      fi
+      if [ "$PROFILE_DEPS_OK" = 1 ]; then
+        say "profile dependency tree updated"
+      else
+        say "! the profile's node_modules could not be updated"
+        say "  Run manually: dsh plugin --profile $PROFILE_NAME install"
+      fi
+
+      # 3) Add the insert block to cordis.patch.yml.
       #
       # Important: in most profiles the file root is an empty list (`[]`).
       # Prepending the insert block produces two root values and invalid YAML
@@ -361,15 +408,25 @@ PY
         if [ "$DRY_RUN" = 1 ]; then
           say "[dry-run] cordis.patch.yml would be created with dsh-notify"
         else
-          printf -- "# dsh-notify - reply completion / question / error notifications\n- insert:\n    - id: notify\n      name: 'dsh-notify'\n" > "$PATCH"
+          # Created atomically and mode 0600: the patch can carry secrets (API
+          # keys, tokens) and the profile's own patch is 0600, so a new one must
+          # not be world-readable.
+          PATCH_TMP="$(mktemp "$PROFILE_DIR/.cordis.patch.XXXXXX")"
+          printf -- "# dsh-notify - reply completion / question / error notifications\n- insert:\n    - id: notify\n      name: 'dsh-notify'\n" > "$PATCH_TMP"
+          chmod 0600 "$PATCH_TMP"
+          mv -f "$PATCH_TMP" "$PATCH"
           say "cordis.patch.yml created with dsh-notify"
         fi
       elif ! grep -q "id: notify" "$PATCH"; then
-        cp "$PATCH" "$PATCH.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -p "$PATCH" "$PATCH.bak.$(date +%Y%m%d-%H%M%S)"
+        # The rewrite is atomic (temp file + os.replace) and keeps the original
+        # mode: an interrupted write used to be able to truncate the profile
+        # patch, which is fatal for the whole profile.
         "$PYTHON" - "$PATCH" <<'PY'
-import sys
+import os, sys, tempfile
 p = sys.argv[1]
-lines = [ln for ln in open(p).read().splitlines() if ln.strip() != "[]"]
+with open(p, encoding="utf-8") as f:
+    lines = [ln for ln in f.read().splitlines() if ln.strip() != "[]"]
 body = "\n".join(lines).strip()
 entry = (
     "# dsh-notify - reply completion / question / error notifications\n"
@@ -377,79 +434,23 @@ entry = (
     "    - id: notify\n"
     "      name: 'dsh-notify'\n"
 )
-open(p, "w").write(entry + ("\n" + body + "\n" if body else ""))
+new_text = entry + ("\n" + body + "\n" if body else "")
+mode = os.stat(p).st_mode & 0o777
+with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(p), delete=False,
+                                 encoding="utf-8") as tf:
+    tf.write(new_text)
+    tmp = tf.name
+os.chmod(tmp, mode)
+os.replace(tmp, p)
 PY
-        # Validate the result using safe standard-library or non-PyYAML parser; roll back if we broke it.
-        if "$PYTHON" - "$PATCH" <<'PY'
-import sys
-p = sys.argv[1]
-
-# Try PyYAML if present
-try:
-    import yaml
-    with open(p, "r", encoding="utf-8") as f:
-        yaml.safe_load(f)
-    sys.exit(0)
-except ImportError:
-    pass
-except Exception:
-    sys.exit(1)
-
-# Safe standard-library YAML structure validator
-try:
-    with open(p, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    lines = text.splitlines()
-    in_single = False
-    in_double = False
-    escape = False
-    stack = []
-
-    for idx, line in enumerate(lines, 1):
-        leading_ws = line[:len(line) - len(line.lstrip())]
-        if "\t" in leading_ws:
-            sys.exit(1)
-
-        trimmed = line.strip()
-        if not trimmed or trimmed.startswith("#"):
-            continue
-
-        for ch in line:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == "'" and not in_double:
-                in_single = not in_single
-            elif ch == '"' and not in_single:
-                in_double = not in_double
-            elif not in_single and not in_double:
-                if ch == "#":
-                    break
-                if ch in "([{":
-                    stack.append(ch)
-                elif ch in ")]}":
-                    if not stack:
-                        sys.exit(1)
-                    top = stack.pop()
-                    if (top == "(" and ch != ")") or (top == "[" and ch != "]") or (top == "{" and ch != "}"):
-                        sys.exit(1)
-        escape = False
-
-    if in_single or in_double or stack:
-        sys.exit(1)
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PY
-        then
+        # Validate the result with the shared checker and roll back if the edit
+        # broke the file. It accepts DSH's own `!!js` tags, which plain
+        # `yaml.safe_load` rejects — that made valid patches look broken.
+        if patch_is_valid "$PATCH"; then
           :  # valid YAML
         else
-          LATEST_BAK="$(ls -t "$PATCH".bak.* 2>/dev/null | head -n1)"
-          [ -n "$LATEST_BAK" ] && cp "$LATEST_BAK" "$PATCH"
+          LATEST_BAK="$(latest_backup "$PATCH")"
+          [ -n "$LATEST_BAK" ] && cp -p "$LATEST_BAK" "$PATCH"
           remove_plugin_from_manifest
           say "! invalid YAML generated; restored cordis.patch.yml and rolled back package.json"
           PLUGIN_DEPS_OK=0
@@ -458,15 +459,15 @@ PY
         say "cordis.patch.yml already linked"
       fi
 
-      # 3) Verify the plugin really imports from the profile's perspective.
+      # 4) Verify the plugin really imports from the profile's perspective.
       if [ "$PLUGIN_DEPS_OK" = 1 ]; then
         if (cd "$PROFILE_DIR" && "$NODE" -e "import('dsh-notify')" >/dev/null 2>&1); then
           say "plugin imports cleanly"
         else
           say "! plugin does not import; removing it from the profile"
           remove_plugin_from_manifest
-          LATEST_BAK="$(ls -t "$PATCH".bak.* 2>/dev/null | head -n1)"
-          [ -n "$LATEST_BAK" ] && cp "$LATEST_BAK" "$PATCH"
+          LATEST_BAK="$(latest_backup "$PATCH")"
+          [ -n "$LATEST_BAK" ] && cp -p "$LATEST_BAK" "$PATCH"
           say "  Profile restored. Check: cd $PLUGIN_DIR && pnpm install"
         fi
       fi

@@ -42,6 +42,28 @@ step() { printf '\n== %s ==\n' "$*"; }
 run() {
   if [ "$DRY_RUN" = 1 ]; then say "[dry-run] $*"; else "$@"; fi
 }
+# Newest backup of a file, empty when there is none. The `|| true` is required:
+# under `set -o pipefail` a failing `ls` (no match) would otherwise abort the
+# script through the enclosing assignment.
+latest_backup() {
+  ls -t "$1".bak.* 2>/dev/null | head -n1 || true
+}
+# Validate a profile patch. 0 = valid (or no validator available), 1 = broken.
+patch_is_valid() {
+  local checker="$REPO_DIR/bin/dsh-yaml-check.py"
+  if [ ! -f "$checker" ]; then
+    say "! YAML validator not found ($checker); skipping the check"
+    return 0
+  fi
+  "$PYTHON" "$checker" "$1"
+}
+
+PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ]; then
+  echo "ERROR: python3 not found." >&2
+  exit 1
+fi
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 step "systemd units"
 if command -v systemctl >/dev/null 2>&1; then
@@ -104,19 +126,26 @@ elif [ -f "$PROFILE_DIR/package.json" ]; then
   if [ "$DRY_RUN" = 1 ]; then
     say "[dry-run] the plugin link would be removed from the profile"
   else
-    python3 - "$PROFILE_DIR/package.json" <<'PY'
-import json, sys
+    # Atomic rewrite: an interrupted write must not truncate the profile
+    # manifest, which is what makes the profile boot at all.
+    "$PYTHON" - "$PROFILE_DIR/package.json" <<'PY'
+import json, os, sys, tempfile
 p = sys.argv[1]
-with open(p) as f:
+with open(p, encoding="utf-8") as f:
     data = json.load(f)
 deps = data.get("dependencies", {})
 if "dsh-notify" in deps:
     deps.pop("dsh-notify")
     if not deps:
         data.pop("dependencies", None)
-    with open(p, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    mode = os.stat(p).st_mode & 0o777
+    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(p), delete=False,
+                                     encoding="utf-8") as tf:
+        json.dump(data, tf, indent=2)
+        tf.write("\n")
+        tmp = tf.name
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
     print("  package.json updated")
 else:
     print("  link already absent")
@@ -127,17 +156,88 @@ PY
     if [ "$DRY_RUN" = 1 ]; then
       say "[dry-run] the notify entry would be removed from cordis.patch.yml"
     else
-      cp "$PATCH" "$PATCH.bak.$(date +%Y%m%d-%H%M%S)"
-      python3 - "$PATCH" <<'PY'
-import re, sys
+      cp -p "$PATCH" "$PATCH.bak.$(date +%Y%m%d-%H%M%S)"
+      # Atomic rewrite that keeps the original mode. The notify entry is removed
+      # whole — its id line plus every deeper-indented line belonging to it
+      # (`name`, and the `config:` block the settings page writes) — and an
+      # `- insert:` line is dropped only when nothing is left under it. Removing
+      # just the first two lines used to leave orphan rows whenever the entry
+      # carried configuration, and orphan rows make the patch unparseable, which
+      # is fatal for the whole profile.
+      "$PYTHON" - "$PATCH" <<'PY'
+import os, re, sys, tempfile
 p = sys.argv[1]
-text = open(p).read()
-# Remove the notify rows inside the insert block, and the block itself when empty.
-text = re.sub(r"# dsh-notify[^\n]*\n", "", text)
-text = re.sub(r"- insert:\n(?:[ \t]+- id: notify\n[ \t]+name: 'dsh-notify'\n)+", "", text)
-open(p, "w").write(text)
+with open(p, encoding="utf-8") as f:
+    text = f.read()
+
+# 1) The notify entry and everything nested under it.
+lines = text.split("\n")
+kept = []
+index = 0
+while index < len(lines):
+    line = lines[index]
+    if line.strip().startswith("- id: notify"):
+        indent = len(line) - len(line.lstrip())
+        index += 1
+        while index < len(lines):
+            follower = lines[index]
+            if not follower.strip():
+                index += 1
+                continue
+            if (len(follower) - len(follower.lstrip())) > indent:
+                index += 1
+                continue
+            break
+        continue
+    kept.append(line)
+    index += 1
+text = "\n".join(kept)
+text = re.sub(r"(?m)^# dsh-notify[^\n]*\n", "", text)
+
+# 2) An `- insert:` line that no longer has any child row.
+lines = text.split("\n")
+kept = []
+for index, line in enumerate(lines):
+    if line.strip() != "- insert:":
+        kept.append(line)
+        continue
+    indent = len(line) - len(line.lstrip())
+    has_child = False
+    for follower in lines[index + 1:]:
+        if not follower.strip() or follower.lstrip().startswith("#"):
+            continue
+        has_child = (len(follower) - len(follower.lstrip())) > indent
+        break
+    if has_child:
+        kept.append(line)
+text = "\n".join(kept)
+
+mode = os.stat(p).st_mode & 0o777
+with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(p), delete=False,
+                                 encoding="utf-8") as tf:
+    tf.write(text)
+    tmp = tf.name
+os.chmod(tmp, mode)
+os.replace(tmp, p)
 print("  cordis.patch.yml updated")
 PY
+      if grep -q "id: notify" "$PATCH"; then
+        say "! the notify entry could not be removed automatically; edit by hand:"
+        say "  $PATCH"
+      fi
+      # A patch that does not parse is fatal for the whole profile, so the edit
+      # is validated (the checker accepts DSH's `!!js` tags) and rolled back on
+      # failure — install.sh has always done this, this script did not.
+      if ! patch_is_valid "$PATCH"; then
+        LATEST_BAK="$(latest_backup "$PATCH")"
+        if [ -n "$LATEST_BAK" ]; then
+          cp -p "$LATEST_BAK" "$PATCH"
+          say "! the edited cordis.patch.yml did not validate; restored the backup"
+        else
+          say "! the edited cordis.patch.yml did not validate and no backup was found"
+          say "  Repair it by hand before starting DSH: $PATCH"
+        fi
+      fi
     fi
   fi
 else

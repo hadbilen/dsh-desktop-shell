@@ -46,28 +46,34 @@ export const DEFAULTS = Object.freeze({
 /**
  * Plugin configuration.
  *
- * Note: `volatile()` is NOT used. In schemastery a `.volatile()` chain destroys
- * the `.default(...)` value (`z.boolean().default(true).volatile()` yields `{}`
- * rather than `true`). That made `settings.configure()` run against a broken
- * schema and the plugin never activated ("failed to import" /
- * "1 entry did not activate").
+ * Every field is `volatile()`, which is what makes DSH render this namespace as
+ * an editable form: `dsh-settings` builds the form from the schema's volatile
+ * fields (`volatileForm()`) and skips an entry that has none — without it the
+ * settings documented in the README never appeared in the interface.
  *
- * The fields set on reply completion or turn start do not need to be live;
- * defaults plus reading the stored settings are enough.
+ * This mirrors DSH's own plugins, which declare their live preferences exactly
+ * this way (`dsh-client-ui-theme`: `z.union([...]).default(...).volatile()`,
+ * `dsh-client-product-analytics`: `z.boolean().default(true).volatile()`).
+ *
+ * Note for consumers: a volatile field resolves to `{}` in schemastery until the
+ * settings document supplies a value, so reading code must fall back to its own
+ * defaults — `DEFAULTS` below is that fallback and the client half applies it.
+ * The `.default(...)` values are kept because they document the intended default
+ * of every field in the composed configuration.
  */
 export const Config = z.object({
   /** Notify when the assistant finishes a reply. */
-  onComplete: z.boolean().default(DEFAULTS.onComplete),
+  onComplete: z.boolean().default(DEFAULTS.onComplete).volatile(),
   /** Notify when the agent asks a question or waits for approval. */
-  onQuestion: z.boolean().default(DEFAULTS.onQuestion),
+  onQuestion: z.boolean().default(DEFAULTS.onQuestion).volatile(),
   /** Notify when the agent ends with an error. */
-  onError: z.boolean().default(DEFAULTS.onError),
+  onError: z.boolean().default(DEFAULTS.onError).volatile(),
   /** Notify only while the window is not focused (to avoid interrupting). */
-  onlyWhenHidden: z.boolean().default(DEFAULTS.onlyWhenHidden),
+  onlyWhenHidden: z.boolean().default(DEFAULTS.onlyWhenHidden).volatile(),
   /** Also notify for subagent sessions. */
-  includeSubagents: z.boolean().default(DEFAULTS.includeSubagents),
+  includeSubagents: z.boolean().default(DEFAULTS.includeSubagents).volatile(),
   /** Play the notification sound. */
-  sound: z.boolean().default(DEFAULTS.sound),
+  sound: z.boolean().default(DEFAULTS.sound).volatile(),
 });
 
 
