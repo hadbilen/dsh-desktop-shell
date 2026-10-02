@@ -114,7 +114,13 @@ window.__ModuleLoader__.load({
 
 			adopt(form.getSnapshot());
 			if (typeof form.subscribe === "function") {
-				ctx.effect(() => form.subscribe((snapshot) => adopt(snapshot)),
+				// `ConfigForm.subscribe` takes a ZERO-ARGUMENT listener
+				// (dsh-client-ui-settings: `subscribe(listener: () => void)` →
+				// `store.subscribe(listener)`, and the store calls it with no
+				// arguments). Receiving a snapshot here meant `adopt(undefined)`
+				// ran on every store publish and silently reset the runtime to
+				// DEFAULTS, so a saved preference never took effect. Pull it.
+				ctx.effect(() => form.subscribe(() => adopt(form.getSnapshot())),
 					"dsh-notify: settings");
 			}
 			return true;
@@ -153,11 +159,20 @@ window.__ModuleLoader__.load({
 		/** Last known running state per session. */
 		const runningState = new Map();
 
-		/** Last notification timestamp per session, used to suppress repeats. */
+		/** Last notification timestamp per session+kind, used to suppress repeats. */
 		const lastNotified = new Map();
 
 		/** Minimum time between two notifications for the same session (ms). */
 		const DEBOUNCE_MS = 2000;
+
+		/** The raw browser permission state: "granted" | "denied" | "default". */
+		function notificationPermission() {
+			try {
+				return typeof Notification === "undefined" ? "unsupported" : Notification.permission;
+			} catch {
+				return "unsupported";
+			}
+		}
 
 		/** Has the browser granted notification permission? */
 		function permissionGranted() {
@@ -202,10 +217,13 @@ window.__ModuleLoader__.load({
 			if (!permissionGranted()) return;
 			if (settings.onlyWhenHidden && windowInForeground()) return;
 
+			// Debounce per session AND kind: an approval notification must not
+			// swallow the completion notification for the same session, which is
+			// what a session-only key did.
 			const now = Date.now();
-			const previous = lastNotified.get(key) ?? 0;
+			const debounceKey = `${key}\u0000${tag}`;
+			const previous = lastNotified.get(debounceKey) ?? 0;
 			if (now - previous < DEBOUNCE_MS) return;
-			lastNotified.set(key, now);
 
 			try {
 				const notification = new Notification(title, {
@@ -223,6 +241,10 @@ window.__ModuleLoader__.load({
 						// The window could not be focused; the notification still closes.
 					}
 				};
+				// Only a notification that really exists starts the debounce window
+				// (setting the timestamp before the constructor meant a throw also
+				// burned the next two seconds).
+				lastNotified.set(debounceKey, now);
 			} catch {
 				// The notification could not be created (permission may be revoked).
 			}
@@ -246,27 +268,36 @@ window.__ModuleLoader__.load({
 		 * @param sessionId - Session being queried.
 		 * @returns true when in the main view; true when unknown (fail safe).
 		 */
-		function isMainSession(ctx, sessionId) {
+		/**
+		 * The `sessions` service, adopted through an optional inject.
+		 *
+		 * It is NOT a hard dependency: a composition without it must still load
+		 * this plugin (notifications keep working, only subagent filtering and
+		 * session titles degrade). Reading `ctx.uiSession` directly — as an
+		 * earlier version did — makes cordis throw `cannot get property
+		 * "uiSession" without inject`, and swallowing that error silently
+		 * disabled both features.
+		 */
+		let sessionSource = null;
+
+		function sessionRow(sessionId) {
 			try {
-				const list = ctx.uiSession?.sessions?.list?.getSnapshot?.();
-				const row = list?.byId?.[sessionId];
-				if (row === undefined) return true;
-				return (row.retainedBy?.mainView ?? 0) > 0;
+				return sessionSource?.list?.getSnapshot?.()?.byId?.[sessionId];
 			} catch {
-				return true;
+				return undefined;
 			}
 		}
 
+		function isMainSession(sessionId) {
+			const row = sessionRow(sessionId);
+			if (row === undefined) return true;
+			return (row.retainedBy?.mainView ?? 0) > 0;
+		}
+
 		/** Resolve a session title; fall back to a short id when unavailable. */
-		function sessionTitle(ctx, sessionId) {
-			try {
-				const list = ctx.uiSession?.sessions?.list?.getSnapshot?.();
-				const row = list?.byId?.[sessionId];
-				const title = row?.title;
-				if (typeof title === "string" && title.trim() !== "") return title.trim();
-			} catch {
-				// The title could not be read.
-			}
+		function sessionTitle(sessionId) {
+			const title = sessionRow(sessionId)?.title;
+			if (typeof title === "string" && title.trim() !== "") return title.trim();
 			const short = String(sessionId ?? "").slice(0, 8);
 			return short ? `Session ${short}` : "DeepSeek Harness";
 		}
@@ -293,6 +324,11 @@ window.__ModuleLoader__.load({
 			"onComplete", "onQuestion", "onError",
 			"onlyWhenHidden", "includeSubagents", "sound"
 		]);
+		/**
+		 * Preferences that raise a notification (the others only shape delivery), so
+		 * switching one of these on is a user gesture worth asking permission for.
+		 */
+		const NOTIFY_KEYS = Object.freeze(["onComplete", "onQuestion", "onError"]);
 		/** Row copy. DSH ships en/zh; `tr` is included for completeness. */
 		const ROW_COPY = {
 			en: {
@@ -308,7 +344,8 @@ window.__ModuleLoader__.load({
 				failed: "Could not save preference",
 				statusLoading: "Waiting for the settings document…",
 				statusNotServed: "This deployment does not serve the \"notify\" settings namespace.",
-				statusUnknown: "Settings state unknown."
+				statusUnknown: "Settings state unknown.",
+				blockedByBrowser: "Notifications are blocked by the browser. Allow them for this page, then reload."
 			},
 			zh: {
 				title: "通知",
@@ -323,7 +360,8 @@ window.__ModuleLoader__.load({
 				failed: "无法保存设置",
 				statusLoading: "正在读取设置…",
 				statusNotServed: "此部署未提供 notify 设置命名空间。",
-				statusUnknown: "设置状态未知。"
+				statusUnknown: "设置状态未知。",
+				blockedByBrowser: "浏览器已阻止通知。请为本页面允许通知，然后重新加载。"
 			},
 			tr: {
 				title: "Bildirimler",
@@ -338,7 +376,8 @@ window.__ModuleLoader__.load({
 				failed: "Ayar kaydedilemedi",
 				statusLoading: "Ayar belgesi bekleniyor…",
 				statusNotServed: "Bu kurulum \"notify\" ayar ad alanını sunmuyor.",
-				statusUnknown: "Ayar durumu bilinmiyor."
+				statusUnknown: "Ayar durumu bilinmiyor.",
+				blockedByBrowser: "Bildirimler tarayıcı tarafından engellenmiş. Bu sayfa için izin verip yeniden yükleyin."
 			}
 		};
 		/** Row layout. Class names are namespaced so they cannot collide. */
@@ -348,18 +387,34 @@ window.__ModuleLoader__.load({
 		/** React runtime and DSH primitives, resolved when the row is registered. */
 		let rowUi = null;
 
-		/** Inject the row stylesheet once (styling is cosmetic). */
+		/**
+		 * Inject the row stylesheet and return its disposer (styling is cosmetic).
+		 *
+		 * The tag used to be appended outside any `ctx.effect`, so a plugin reload
+		 * left it behind. DSH's own theme plugin removes its tag the same way.
+		 *
+		 * @returns a disposer removing the tag.
+		 */
 		function injectRowStyles() {
 			try {
-				if (typeof document === "undefined") return;
-				if (document.querySelector(`style[data-plugin-css="${ROW_CSS_ID}"]`) !== null) return;
+				if (typeof document === "undefined") return () => {};
+				const existing = document.querySelector(`style[data-plugin-css="${ROW_CSS_ID}"]`);
+				if (existing !== null) return () => {};
 				const tag = document.createElement("style");
 				tag.dataset.plugin = "dsh-notify";
 				tag.dataset.pluginCss = ROW_CSS_ID;
 				tag.textContent = ROW_CSS;
 				document.head.appendChild(tag);
+				return () => {
+					try {
+						tag.remove();
+					} catch {
+						// Already gone.
+					}
+				};
 			} catch {
 				// Without the stylesheet the row still works.
+				return () => {};
 			}
 		}
 
@@ -383,12 +438,24 @@ window.__ModuleLoader__.load({
 			// The selector must pick the FIELD: returning the whole store state would
 			// hand an object to React as a child (error #31) and the slot entry would
 			// be dropped — the row disappeared without a trace.
-			const notice = props.useNotice((value) => value?.notice);
+			// The hook exists only when the snapshot store resolved; without it the row
+			// must still render. A missing hook used to throw and drop the whole entry.
+			const notice = typeof props.useNotice === "function"
+				? props.useNotice((value) => value?.notice)
+				: null;
 			const ready = form?.status === "ready" && form?.writable === true;
 			const value = form?.value ?? {};
 			const control = (key) => {
 				const checked = value[key] === true;
-				const onChange = (next) => props.save(key, next);
+				const onChange = (next) => {
+					// Ask for the OS permission on ANY interaction with a notification
+					// switch. Asking only when one is switched ON never fires for the
+					// default state (all three are already on), so a fresh profile could
+					// never grant the permission — and the attach-time request has no
+					// user gesture and is usually denied.
+					if (NOTIFY_KEYS.includes(key)) requestPermission();
+					return props.save(key, next);
+				};
 				const label = props.t(key);
 				// The DSH Switch primitive renders `label` as an aria-label ONLY, so the
 				// visible text is drawn here — the same way DSH's own settings rows do it.
@@ -423,9 +490,14 @@ window.__ModuleLoader__.load({
 					children: ROW_FIELDS.map(control)
 				})
 			];
-			const note = ready
+			let note = ready
 				? (typeof notice === "string" && notice !== "" ? notice : null)
 				: props.status();
+			// A denied OS permission means permanently silent notifications; the row
+			// must say so instead of looking healthy.
+			if (ready && notificationPermission() === "denied") {
+				note = "blockedByBrowser";
+			}
 			if (note) {
 				children.push(rowUi.jsx("div", {
 					className: "dsh-notify-row__notice",
@@ -514,7 +586,7 @@ window.__ModuleLoader__.load({
 			};
 
 			rowUi = ui;
-			injectRowStyles();
+			ctx.effect(() => injectRowStyles(), "dsh-notify: row styles");
 			ctx.effect(() => ctx.locale.register(ROW_LOCALE, ROW_COPY),
 				"dsh-notify: settings row copy");
 			// Registered directly, NOT gated by `whileServed`: the row reports its own
@@ -561,6 +633,15 @@ window.__ModuleLoader__.load({
 			applySettings(ctx);
 			requestPermission();
 
+			// Optional: the session list, used for subagent filtering and titles.
+			ctx.inject(["sessions"], (child) => {
+				try {
+					sessionSource = child.sessions;
+				} catch {
+					sessionSource = null;
+				}
+			});
+
 			// Settings row: optional on purpose. It needs the settings page, React and
 			// the UI primitives; when any of them is missing the row is skipped and the
 			// notifications keep working with the values already adopted above.
@@ -584,15 +665,25 @@ window.__ModuleLoader__.load({
 				if (running || previous !== true) return;
 				if (!settings.onComplete) return;
 
-				if (!settings.includeSubagents && !isMainSession(ctx, sessionId)) return;
+				if (!settings.includeSubagents && !isMainSession(sessionId)) return;
 
 				notify(
 					sessionId,
 					"Reply ready",
-					sessionTitle(ctx, sessionId),
+					sessionTitle(sessionId),
 					`dsh-complete-${sessionId}`
 				);
 			}), "dsh-notify: turn finished");
+
+			// --- 1b) Session bookkeeping --------------------------------------
+			// Both maps are keyed by session id and grew forever; a long-running
+			// shell accumulated one entry per session it had ever seen.
+			ctx.effect(() => ctx.remote.$on("api-session/removed", (sessionId) => {
+				runningState.delete(sessionId);
+				for (const key of [...lastNotified.keys()]) {
+					if (key.startsWith(`${sessionId}\u0000`)) lastNotified.delete(key);
+				}
+			}), "dsh-notify: session cleanup");
 
 			// --- 2) Question / approval ---------------------------------------
 			ctx.effect(() => ctx.remote.$on("approval/request", (request, next) => {
@@ -604,12 +695,12 @@ window.__ModuleLoader__.load({
 					const agent = request?.agent;
 					const sessionId = agent?.id ?? "approval";
 					if (settings.onQuestion
-						&& (settings.includeSubagents || isMainSession(ctx, sessionId))) {
+						&& (settings.includeSubagents || isMainSession(sessionId))) {
 						const reason = summarize(request?.reason ?? request?.toolName ?? "");
 						notify(
 							sessionId,
 							"Input needed",
-							reason || sessionTitle(ctx, sessionId),
+							reason || sessionTitle(sessionId),
 							`dsh-approval-${sessionId}`
 						);
 						runningState.set(sessionId, true);
@@ -623,11 +714,11 @@ window.__ModuleLoader__.load({
 			// --- 3) Agent error -----------------------------------------------
 			ctx.effect(() => ctx.remote.$on("api-session/error", (sessionId, error) => {
 				if (!settings.onError) return;
-				if (!settings.includeSubagents && !isMainSession(ctx, sessionId)) return;
+				if (!settings.includeSubagents && !isMainSession(sessionId)) return;
 				notify(
 					sessionId,
 					"DSH: error",
-					summarize(String(error ?? "")) || sessionTitle(ctx, sessionId),
+					summarize(String(error ?? "")) || sessionTitle(sessionId),
 					`dsh-error-${sessionId}`
 				);
 			}), "dsh-notify: agent error");

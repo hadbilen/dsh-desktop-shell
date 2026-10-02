@@ -7,7 +7,13 @@ Documentation=https://github.com/deepseek-ai/deepseek-harness
 # permanently inactive. timers.target exists everywhere, so it is used for the
 # dependency and the service itself checks whether a notification daemon is
 # actually reachable before trying to notify.
-After=default.target
+#
+# Do NOT add `After=default.target` here: default.target is ordered after
+# basic.target, which is ordered after timers.target, so the timer would be part
+# of an ordering cycle. systemd resolves that by DELETING the timer job
+# ("Job dsh-update-check.timer/start deleted to break ordering cycle") and the
+# update check then never runs in that session. PartOf= is not ordering, so it
+# stays: the timer still stops with the session.
 PartOf=default.target
 
 [Timer]

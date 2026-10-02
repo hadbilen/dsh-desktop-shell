@@ -25,7 +25,7 @@
 set -u
 
 URL="${DSH_WEB_URL:-http://127.0.0.1:3080}"
-PROFILE="${DSH_APP_PROFILE:-$HOME/.local/share/dsh-app}"
+PROFILE="${DSH_APP_PROFILE:-${XDG_DATA_HOME:-$HOME/.local/share}/dsh-app}"
 find_browser() {
   if [ -n "${DSH_CHROME:-}" ] && command -v "$DSH_CHROME" >/dev/null 2>&1; then
     printf '%s' "$DSH_CHROME"
@@ -55,6 +55,21 @@ fi
 
 MARKER="$PROFILE/.dsh-bootstrapped"
 REBOOTSTRAP_DAYS=25   # DSH cookie lasts 30 days; 5 days of safety margin
+
+if ! command -v curl >/dev/null 2>&1; then
+  # Without curl every probe returns "000" and the script would blame the
+  # service for a missing tool.
+  cat >&2 <<'EOF'
+dsh: curl is required to check whether the DSH Web service is up.
+  Install it: sudo apt install curl
+  Or set DSH_APP_PROFILE/DSH_CHROME and start the browser yourself.
+EOF
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a DSH -u critical "DSH: curl not found" \
+      "The browser-window fallback needs curl to probe the service." 2>/dev/null || true
+  fi
+  exit 1
+fi
 
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1" 2>/dev/null; }
 
@@ -141,6 +156,13 @@ if needs_bootstrap; then
     printf 'dsh: no session token found; trying the plain URL (expect a 401).\n' >&2
     printf '     Log   : journalctl --user -u dsh-web.service -n 50\n' >&2
     printf '     Fix   : systemctl --user restart dsh-web.service\n' >&2
+    # stderr is invisible when the shortcut is launched from the menu, so say it
+    # where the user actually looks.
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -a DSH -u normal "DSH: session token not found" \
+        "The window may show 'authentication required'. Fix: systemctl --user restart dsh-web.service" \
+        2>/dev/null || true
+    fi
   fi
 fi
 
@@ -158,6 +180,25 @@ case "${DSH_TRAY_WINDOW:-maximized}" in
   *)          WINDOW_ARGS+=(--start-maximized) ;;
 esac
 
+# This fallback cannot inject the keystroke that opens a fresh session (that is a
+# tray-shell feature), so `--new-chat` / DSH_NEW_CHAT=1 only deserve a note — and
+# our own flags must not be handed to Chrome as if they were browser switches.
+CHROME_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --new-chat|--resume|--update) ;;
+    *) CHROME_ARGS+=("$arg") ;;
+  esac
+done
+case " $* " in
+  *" --new-chat "*)
+    printf 'dsh: --new-chat needs the tray shell (PyQt6 WebEngine); this window resumes the last session.\n' >&2
+    ;;
+esac
+if [ "${DSH_NEW_CHAT:-0}" = "1" ] && [ "${*#*--new-chat}" = "$*" ]; then
+  printf 'dsh: DSH_NEW_CHAT=1 needs the tray shell; this window resumes the last session.\n' >&2
+fi
+
 exec "$CHROME" \
   --app="$TARGET" \
   --class=DSH-Desktop \
@@ -166,4 +207,4 @@ exec "$CHROME" \
   --no-first-run \
   --no-default-browser-check \
   "${WINDOW_ARGS[@]}" \
-  "$@"
+  ${CHROME_ARGS[@]+"${CHROME_ARGS[@]}"}

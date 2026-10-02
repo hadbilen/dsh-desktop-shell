@@ -48,6 +48,11 @@ run() {
 latest_backup() {
   ls -t "$1".bak.* 2>/dev/null | head -n1 || true
 }
+# Is the dsh-notify entry present? Exact match: a prefix test also matches
+# unrelated entries such as `- id: notify-slack` (install.sh uses the same rule).
+patch_has_notify() {
+  grep -qE "^[[:space:]]*-[[:space:]]*id:[[:space:]]*['\"]?notify['\"]?[[:space:]]*$" "$1"
+}
 # Validate a profile patch. 0 = valid (or no validator available), 1 = broken.
 patch_is_valid() {
   local checker="$REPO_DIR/bin/dsh-yaml-check.py"
@@ -78,7 +83,7 @@ for u in dsh-web.service dsh-proxy.service dsh-update-check.service \
          dsh-update-check.timer; do
   if [ -f "$UNIT_DIR/$u" ]; then
     run rm -f "$UNIT_DIR/$u"
-    say "removed: $u"
+    [ "$DRY_RUN" = 1 ] || say "removed: $u"
   fi
 done
 if command -v systemctl >/dev/null 2>&1; then
@@ -91,7 +96,7 @@ for f in dsh-tray.py dsh-update.py dsh-update dsh-desktop-launch.sh \
          dsh-app-window.sh dsh-launcher.sh dsh-tailscale-proxy.mjs; do
   if [ -f "$BIN_DIR/$f" ]; then
     run rm -f "$BIN_DIR/$f"
-    say "removed: $f"
+    [ "$DRY_RUN" = 1 ] || say "removed: $f"
   fi
 done
 
@@ -99,13 +104,30 @@ step "Desktop entries and icons"
 # Both the current names and the legacy names from older releases are cleaned.
 for f in dsh-desktop.desktop dsh-desktop-browser.desktop \
          dsh-desktop-chrome.desktop deepseek-harness-web.desktop; do
-  [ -f "$APP_DIR/$f" ] && { run rm -f "$APP_DIR/$f"; say "removed: $f"; }
+  if [ -f "$APP_DIR/$f" ]; then
+    run rm -f "$APP_DIR/$f"
+    [ "$DRY_RUN" = 1 ] || say "removed: $f"
+  fi
 done
 
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
-if [ -L "$DESKTOP_DIR/dsh-desktop.desktop" ] || [ -f "$DESKTOP_DIR/dsh-desktop.desktop" ]; then
-  run rm -f "$DESKTOP_DIR/dsh-desktop.desktop" 2>/dev/null || true
-  say "shortcut removed"
+SHORTCUT="$DESKTOP_DIR/dsh-desktop.desktop"
+if [ -L "$SHORTCUT" ]; then
+  # Only remove a link that points into this installation: a user may keep their
+  # own dsh-desktop.desktop in the desktop directory.
+  SHORTCUT_TARGET="$(readlink -f "$SHORTCUT" 2>/dev/null || true)"
+  case "$SHORTCUT_TARGET" in
+    "$APP_DIR"/*|"$DATA_DIR"/applications/*)
+      run rm -f "$SHORTCUT" 2>/dev/null || true
+      [ "$DRY_RUN" = 1 ] || say "shortcut removed"
+      ;;
+    *)
+      say "kept: $SHORTCUT points outside this installation"
+      ;;
+  esac
+elif [ -f "$SHORTCUT" ]; then
+  run rm -f "$SHORTCUT" 2>/dev/null || true
+  [ "$DRY_RUN" = 1 ] || say "shortcut removed"
 fi
 
 run rm -f "$ICON_DIR/dsh-desktop.png" "$ICON_DIR/dsh-desktop.svg"
@@ -113,7 +135,7 @@ for sz in 32x32 48x48 64x64 128x128 256x256; do
   f="$ICON_DIR/hicolor/$sz/apps/dsh-desktop.png"
   [ -f "$f" ] && run rm -f "$f"
 done
-say "icons removed"
+[ "$DRY_RUN" = 1 ] || say "icons removed"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   run update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
@@ -150,9 +172,16 @@ if "dsh-notify" in deps:
 else:
     print("  link already absent")
 PY
+    # The manifest entry is gone, but the profile's node_modules link would
+    # survive as a dangling symlink once the plugin source is deleted.
+    LINK="$PROFILE_DIR/node_modules/dsh-notify"
+    if [ -L "$LINK" ]; then
+      run rm -f "$LINK"
+      [ "$DRY_RUN" = 1 ] || say "profile link removed: $LINK"
+    fi
   fi
   PATCH="$PROFILE_DIR/cordis.patch.yml"
-  if [ -f "$PATCH" ] && grep -q "id: notify" "$PATCH"; then
+  if [ -f "$PATCH" ] && patch_has_notify "$PATCH"; then
     if [ "$DRY_RUN" = 1 ]; then
       say "[dry-run] the notify entry would be removed from cordis.patch.yml"
     else
@@ -170,13 +199,14 @@ p = sys.argv[1]
 with open(p, encoding="utf-8") as f:
     text = f.read()
 
-# 1) The notify entry and everything nested under it.
+# 1) The notify entry and everything nested under it. The match is EXACT: a
+# prefix test also swallowed unrelated entries such as `- id: notify-slack`.
 lines = text.split("\n")
 kept = []
 index = 0
 while index < len(lines):
     line = lines[index]
-    if line.strip().startswith("- id: notify"):
+    if re.fullmatch(r"-\s*id:\s*['\"]?notify['\"]?", line.strip()):
         indent = len(line) - len(line.lstrip())
         index += 1
         while index < len(lines):
@@ -221,7 +251,7 @@ os.chmod(tmp, mode)
 os.replace(tmp, p)
 print("  cordis.patch.yml updated")
 PY
-      if grep -q "id: notify" "$PATCH"; then
+      if patch_has_notify "$PATCH"; then
         say "! the notify entry could not be removed automatically; edit by hand:"
         say "  $PATCH"
       fi
@@ -246,7 +276,7 @@ fi
 
 if [ "$KEEP_PLUGIN" = 0 ] && [ -d "$DATA_DIR/dsh-desktop" ]; then
   run rm -rf "$DATA_DIR/dsh-desktop"
-  say "removed: $DATA_DIR/dsh-desktop"
+  [ "$DRY_RUN" = 1 ] || say "removed: $DATA_DIR/dsh-desktop"
 fi
 
 if [ "$PURGE" = 1 ]; then

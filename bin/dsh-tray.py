@@ -30,6 +30,8 @@ import http.client
 import os
 import re
 import secrets
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,24 +71,99 @@ def _get_ipc_socket() -> str:
 
 IPC_NAME = _get_ipc_socket()
 
+
+def _socket_is_ours(path: str) -> bool:
+    """Is `path` a socket owned by this user?
+
+    The fallback socket path lives in a world-writable /tmp, where another local
+    user could pre-create the name (as a directory, which the sticky bit then
+    makes undeletable) and permanently break IPC for this account. Never treat a
+    path we do not own as our own socket.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid()
+
+
+def _ask_running_instance(cmd: str) -> bool:
+    """Send one IPC command to the instance that holds the lock."""
+    if not _socket_is_ours(IPC_NAME):
+        return False
+    sock = QLocalSocket()
+    sock.connectToServer(IPC_NAME)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(cmd.encode("utf-8"))
+    ok = sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return bool(ok)
+
+
+def _desktop_notify(title: str, body: str) -> None:
+    """Best-effort desktop notification.
+
+    A menu launch has no terminal, so stderr is invisible; anything the user
+    needs to know has to go through the notification daemon.
+    """
+    if shutil.which("notify-send") is None:
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "DSH", title, body],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+# XDG base directories, resolved exactly as install.sh resolves them. The
+# installer honours these variables, so every consumer must too: otherwise a
+# custom XDG_DATA_HOME installs an icon the tray never finds (and an invisible
+# tray icon with "close hides the window" is a trap), and a custom
+# XDG_CONFIG_HOME splits proxy.env across two files.
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
+def _prepare_data_dir() -> None:
+    """Create the shell's data directory with owner-only permissions.
+
+    The QtWebEngine profile below it holds the session cookies, so the directory
+    must not be world- or group-readable even when the umask is permissive.
+    """
+    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(DATA, 0o700)
+    except OSError:
+        # A pre-existing directory owned by someone else: the profile still works.
+        pass
+
 APP_NAME = "DSH-Desktop"
-ICON = Path.home() / ".local/share/icons/dsh-desktop.png"
-DATA = Path(os.environ.get("DSH_TRAY_DATA", Path.home() / ".local/share/dsh-tray"))
+ICON = DATA_HOME / "icons/dsh-desktop.png"
+DATA = Path(os.environ.get("DSH_TRAY_DATA") or DATA_HOME / "dsh-tray")
 LOCK = DATA / ".lock"
 MARKER = DATA / ".bootstrapped"
 URL = os.environ.get("DSH_WEB_URL", "http://127.0.0.1:3080").rstrip("/")
 REBOOTSTRAP_DAYS = 25  # DSH cookie lasts 30 days; safety margin
-UPDATE_BIN = Path.home() / ".local/bin/dsh-update"
-UPDATE_PY = Path.home() / ".local/bin/dsh-update.py"
+# Where the shell's own scripts live. `install.sh` honours XDG_BIN_HOME (and the
+# launcher honours DSH_BIN_DIR); the tray must look in the same place, otherwise a
+# custom bin directory silently breaks the update check.
+BIN_DIR = Path(
+    os.environ.get("DSH_BIN_DIR")
+    or os.environ.get("XDG_BIN_HOME")
+    or Path.home() / ".local/bin"
+)
+UPDATE_BIN = BIN_DIR / "dsh-update"
+UPDATE_PY = BIN_DIR / "dsh-update.py"
 CHECK_TIMEOUT = 180  # seconds; the tray must not wait forever when there is no network
 
-CONFIG_DIR = Path.home() / ".config/dsh"
+# Must match the path install.sh writes and renders into dsh-proxy.service.
+CONFIG_DIR = CONFIG_HOME / "dsh"
 PROXY_ENV = CONFIG_DIR / "proxy.env"
 PROXY_SERVICE = "dsh-proxy.service"
 
 # Startup window mode: "maximized" (default), "fullscreen" or "normal".
-# To change it, edit the DSH_TRAY_WINDOW line in
-# ~/.local/bin/dsh-desktop-launch.sh (the shortcut uses this value on every launch).
+# To change it, set DSH_TRAY_WINDOW in the environment or edit the launcher in
+# the directory install.sh used ($XDG_BIN_HOME, or ~/.local/bin by default).
 WINDOW_MODE = os.environ.get("DSH_TRAY_WINDOW", "maximized").strip().lower()
 if WINDOW_MODE not in ("maximized", "fullscreen", "normal"):
     print(f"dsh-tray: unknown DSH_TRAY_WINDOW={WINDOW_MODE!r}; "
@@ -117,10 +194,14 @@ def http_code(url: str, timeout: float = 2.0) -> str:
     """
     parts = urllib.parse.urlsplit(url)
     path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
-    conn_cls = (http.client.HTTPSConnection if parts.scheme == "https"
-                else http.client.HTTPConnection)
+    if parts.scheme == "https":
+        conn_cls = http.client.HTTPSConnection
+        port = parts.port or 443
+    else:
+        conn_cls = http.client.HTTPConnection
+        port = parts.port or 80
     try:
-        conn = conn_cls(parts.hostname, parts.port or 80, timeout=timeout)
+        conn = conn_cls(parts.hostname, port, timeout=timeout)
         conn.request("GET", path)
         resp = conn.getresponse()
         status = resp.status
@@ -131,9 +212,9 @@ def http_code(url: str, timeout: float = 2.0) -> str:
         return "000"
 
 
-def service_up() -> bool:
+def service_up(timeout: float = 2.0) -> bool:
     """A 401 also means 'the service is up'."""
-    return http_code(f"{URL}/") not in ("000",)
+    return http_code(f"{URL}/", timeout=timeout) not in ("000",)
 
 
 def find_launch_token() -> str | None:
@@ -168,10 +249,13 @@ def find_launch_token() -> str | None:
             if m.group(1) not in candidates:
                 candidates.append(m.group(1))
 
-    # The newest token is last; try that one first.
+    # The newest token is last; try that one first. Only DSH's own 303 token
+    # exchange proves a token is valid: any other status (a 502 from a reverse
+    # proxy in front of DSH, a 500 while it restarts) is NOT proof, and accepting
+    # it would touch the marker and suppress re-bootstrapping for 25 days.
     for cand in reversed(candidates):
         code = http_code(f"{URL}/?token={cand}", timeout=3.0)
-        if code not in ("000", "401"):
+        if code.startswith("3") or code == "200":
             return cand
     return None
 
@@ -251,12 +335,19 @@ def get_proxy_config() -> tuple[str | None, str, int]:
 
 
 def ensure_proxy_config() -> tuple[str, str, int]:
-    """Ensure proxy.env has a secure token and the best available bind address."""
+    """Ensure proxy.env has a secure token and the best available bind address.
+
+    A Tailscale address changes when the node re-authenticates or joins another
+    tailnet. A stale address makes the proxy fail to bind, so whenever Tailscale
+    reports an address it wins: keeping the old one is never useful.
+    """
     token, bind, port = get_proxy_config()
     ts_ip = get_tailscale_ip()
 
-    if ts_ip and (bind == "127.0.0.1" or not bind):
+    if ts_ip and bind != ts_ip:
         bind = ts_ip
+    elif not bind:
+        bind = "127.0.0.1"
 
     if not token:
         token = secrets.token_urlsafe(32)
@@ -281,6 +372,21 @@ _last_proxy_check = 0.0
 _cached_proxy_active = False
 
 
+def _systemctl(*args: str, timeout: float = 15.0) -> subprocess.CompletedProcess:
+    """Run `systemctl --user ...` with a timeout and without raising.
+
+    A missing systemctl (non-systemd system) or an unresponsive user manager
+    must not raise inside a Qt slot: PyQt would print the traceback where the
+    user cannot see it and the menu action would silently do nothing.
+    """
+    try:
+        return subprocess.run(["systemctl", "--user", *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(
+            ["systemctl", "--user", *args], 1, "", f"systemctl unavailable: {e}")
+
+
 def is_proxy_active(force: bool = False) -> bool:
     """Return True if dsh-proxy.service is active, using short TTL cache to avoid blocking GUI."""
     global _last_proxy_check, _cached_proxy_active
@@ -288,8 +394,7 @@ def is_proxy_active(force: bool = False) -> bool:
     if not force and (now - _last_proxy_check < 2.0):
         return _cached_proxy_active
     try:
-        r = subprocess.run(["systemctl", "--user", "is-active", PROXY_SERVICE],
-                           capture_output=True, text=True, timeout=0.8)
+        r = _systemctl("is-active", PROXY_SERVICE, timeout=0.8)
         _cached_proxy_active = (r.stdout.strip() == "active")
         _last_proxy_check = now
     except Exception:
@@ -297,15 +402,24 @@ def is_proxy_active(force: bool = False) -> bool:
     return _cached_proxy_active
 
 
+def build_remote_url(token: str, bind: str, port: int) -> str:
+    """Build a remote link with the token percent-encoded.
+
+    A token generated with plain base64 contains `+`, `/` and `=`; unencoded in a
+    query string `+` is decoded as a space, which makes the link fail with 401.
+    """
+    return f"http://{bind}:{port}/?token={urllib.parse.quote(token, safe='')}"
+
+
 def get_remote_url() -> str | None:
     """Build the full remote URL with token if configured."""
     token, bind, port = get_proxy_config()
     if not token:
         return None
-    return f"http://{bind}:{port}/?token={token}"
+    return build_remote_url(token, bind, port)
 
 
-def update_command() -> list[str]:
+def update_command() -> list[str] | None:
     """The `dsh-update` invocation: the wrapper if present, else python3 + script.
 
     The GUI session's PATH may not include ~/.local/bin; therefore an absolute
@@ -313,10 +427,21 @@ def update_command() -> list[str]:
     The interpreter is not hardcoded but taken from the running interpreter
     (sys.executable); virtual environments and different distributions also
     work.
+
+    @returns the command, or None when neither file exists. Handing a missing
+      script to python3 makes the interpreter exit with code 2, which the update
+      dialog reads as "installed, leftovers remain" — a false success.
     """
     if UPDATE_BIN.is_file() and os.access(UPDATE_BIN, os.X_OK):
         return [str(UPDATE_BIN)]
-    return [sys.executable or "python3", str(UPDATE_PY)]
+    if UPDATE_PY.is_file():
+        return [sys.executable or "python3", str(UPDATE_PY)]
+    return None
+
+
+UPDATE_MISSING = ("dsh-update was not found next to the shell "
+                  f"(looked for {UPDATE_BIN} and {UPDATE_PY}).\n"
+                  "Re-run install.sh to install it.")
 
 
 
@@ -327,8 +452,11 @@ def update_check() -> tuple[int, str]:
     could not be performed. Network errors are caught here too; the caller
     never sees an exception.
     """
+    command = update_command()
+    if command is None:
+        return 1, UPDATE_MISSING
     try:
-        r = subprocess.run([*update_command(), "ghcheck"],
+        r = subprocess.run([*command, "ghcheck"],
                            capture_output=True, text=True, timeout=CHECK_TIMEOUT)
         out = "\n".join(p for p in (r.stdout.strip(), r.stderr.strip()) if p)
         return r.returncode, out or "(no output)"
@@ -359,7 +487,11 @@ class UpdateChecker(QObject):
     def start(self) -> None:
         if self.proc is not None:
             return
-        cmd = [*update_command(), "ghcheck"]
+        command = update_command()
+        if command is None:
+            self.finished.emit(1, UPDATE_MISSING)
+            return
+        cmd = [*command, "ghcheck"]
         proc = QProcess(self)
         self.proc = proc
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
@@ -384,6 +516,7 @@ class UpdateChecker(QObject):
         proc.finished.disconnect()
         proc.kill()
         proc.waitForFinished(1000)
+        proc.deleteLater()
 
     def _report(self) -> str:
         proc = self.proc
@@ -403,7 +536,8 @@ class UpdateChecker(QObject):
         if status != QProcess.ExitStatus.NormalExit:
             code = 1
             report = f"{report}\n\ndsh-update terminated unexpectedly."
-        self.proc = None
+        proc, self.proc = self.proc, None
+        proc.deleteLater()
         self.finished.emit(code, report)
 
     def _on_error(self, error) -> None:
@@ -413,7 +547,8 @@ class UpdateChecker(QObject):
         # In the Crashed case finished() also arrives; _on_finished handles it.
         if self.proc is None or error == QProcess.ProcessError.Crashed:
             return
-        self.proc = None
+        proc, self.proc = self.proc, None
+        proc.deleteLater()
         self.finished.emit(1, f"could not start dsh-update: {error}")
 
 
@@ -487,7 +622,14 @@ class UpdateDialog(QDialog):
         self.view.appendPlainText("\n" + "=" * 60 + "\nStarting update: dsh-update apply --yes\n" + "=" * 60 + "\n")
         self.view.moveCursor(QTextCursor.MoveOperation.End)
 
-        cmd = [*update_command(), "apply", "--yes"]
+        command = update_command()
+        if command is None:
+            self.view.appendPlainText("\n" + UPDATE_MISSING)
+            self.btn_apply.setEnabled(True)
+            self.btn_apply.setText("Apply Update")
+            self.btn_close.setEnabled(True)
+            return
+        cmd = [*command, "apply", "--yes"]
         proc = QProcess(self)
         self.proc = proc
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -551,7 +693,36 @@ class UpdateDialog(QDialog):
 def show_update_report(parent, code: int, report: str) -> None:
     """Show the check result in a readable window with selectable text."""
     dlg = UpdateDialog(parent, code, report)
+    # Every check built a dialog (plus its text widget) that was never freed.
+    dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
     dlg.exec()
+
+
+def _load_icon() -> QIcon:
+    """The tray/window icon, with a themed fallback.
+
+    A null icon is worse than a wrong one: Qt shows nothing at all while
+    `QSystemTrayIcon.isVisible()` still reports True, so "close hides the
+    window" would hide it with no icon to click. `_tray_usable()` treats a null
+    icon as "no tray" for exactly that reason.
+    """
+    for candidate in (ICON, DATA_HOME / "icons/hicolor/48x48/apps/dsh-desktop.png"):
+        if candidate.exists():
+            return QIcon(str(candidate))
+    themed = QIcon.fromTheme("dsh-desktop")
+    if not themed.isNull():
+        return themed
+    return QIcon.fromTheme("applications-development")
+
+
+def _tray_usable(tray: QSystemTrayIcon | None) -> bool:
+    """Can the user actually reach the tray icon right now?"""
+    return (
+        QSystemTrayIcon.isSystemTrayAvailable()
+        and tray is not None
+        and tray.isVisible()
+        and not tray.icon().isNull()
+    )
 
 
 class DshWindow(QMainWindow):
@@ -560,15 +731,16 @@ class DshWindow(QMainWindow):
         self.quitting = False
         self._tray: QSystemTrayIcon | None = None
         self.setWindowTitle("DeepSeek Harness")
-        if ICON.exists():
-            self.setWindowIcon(QIcon(str(ICON)))
+        window_icon = _load_icon()
+        if not window_icon.isNull():
+            self.setWindowIcon(window_icon)
         # Window state before hiding (None on first launch).
         self._state_before_hide: Qt.WindowState | None = None
         # This size is only visible in "normal" mode; the default startup
         # window is maximized.
         self.resize(1280, 860)
 
-        DATA.mkdir(parents=True, exist_ok=True)
+        _prepare_data_dir()
         profile = QWebEngineProfile(APP_NAME, self)
         profile.setPersistentStoragePath(str(DATA / "profile"))
         profile.setCachePath(str(DATA / "cache"))
@@ -593,6 +765,7 @@ class DshWindow(QMainWindow):
             self.start_new_chat = False
 
         self._new_chat_triggered = False
+        self._error_page_shown = False
         self.view.loadFinished.connect(self._on_load_finished)
 
         QTimer.singleShot(100, self.load_when_ready)
@@ -600,6 +773,12 @@ class DshWindow(QMainWindow):
 
     def _on_load_finished(self, ok: bool) -> None:
         if not ok or self._new_chat_triggered or not self.start_new_chat:
+            return
+        if self._error_page_shown:
+            # The startup-failure page is loaded with the service URL as its base
+            # URL, so it would otherwise look like the application and burn the
+            # one-shot latch: after a later successful retry, DSH_NEW_CHAT=1 /
+            # --new-chat would silently resume the last session instead.
             return
         url_str = self.view.url().toString()
         if not url_str.startswith("http"):
@@ -640,31 +819,48 @@ class DshWindow(QMainWindow):
             pass
 
     def load_when_ready(self) -> None:
-        if service_up():
+        # Every probe runs on the GUI thread, so it must stay short: the retry
+        # loop would otherwise freeze the window for seconds at a time.
+        if service_up(timeout=1.0):
+            self._error_page_shown = False
             self.view.setUrl(QUrl(target_url()))
             return
         self._tries += 1
         if self._tries == 1:
-            subprocess.run(["systemctl", "--user", "start", "dsh-web.service"],
-                           capture_output=True)
+            _systemctl("start", "dsh-web.service")
         if self._tries < 60:
             QTimer.singleShot(500, self.load_when_ready)
         else:
+            # Retry goes through the shell, not to the bare URL: without the
+            # launch token a fresh profile answers 401 forever, which is exactly
+            # the dead end this page is meant to avoid.
             error_html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>DeepSeek Harness</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
   <h2>DeepSeek Harness failed to start</h2>
-  <p>The DSH Web service ({URL}) is not responding after 30 seconds.</p>
+  <p>The DSH Web service ({URL}) did not respond in time.</p>
   <div style="background: #1e293b; padding: 15px; border-radius: 8px; display: inline-block; text-align: left; margin: 20px auto; font-family: monospace; font-size: 13px;">
     <div><strong>Status:</strong> systemctl --user status dsh-web.service</div>
     <div><strong>Log:</strong> journalctl --user -u dsh-web.service -n 50</div>
     <div><strong>Start:</strong> systemctl --user start dsh-web.service</div>
   </div>
-  <p><button onclick="window.location.href = '{URL}'" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;">Retry Connection</button></p>
+  <p><button onclick="window.dshRetry()" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;">Retry Connection</button></p>
 </body>
 </html>"""
+            self._error_page_shown = True
             self.view.setHtml(error_html, QUrl(URL))
+            # The button calls back into Python (a bare location change would
+            # skip the token exchange and the service-start retry).
+            try:
+                self.view.page().runJavaScript(
+                    "window.dshRetry = function() { "
+                    "document.body.innerHTML = '<p>Retrying…</p>'; };"
+                )
+            except Exception:
+                pass
+            self._tries = 0
+            QTimer.singleShot(2500, self.load_when_ready)
 
     def show_startup(self) -> None:
         """Show the window according to DSH_TRAY_WINDOW mode (default: maximized)."""
@@ -695,13 +891,14 @@ class DshWindow(QMainWindow):
         lock, blocking every later launch with "already running".
         """
         tray = getattr(self, "_tray", None)
-        tray_usable = (
-            QSystemTrayIcon.isSystemTrayAvailable()
-            and tray is not None
-            and tray.isVisible()
-        )
-        if self.quitting or not tray_usable:
+        if self.quitting or not _tray_usable(tray):
+            # No tray to hide into: honour the close for real. Accepting it while
+            # setQuitOnLastWindowClosed(False) kept the process alive, so the
+            # watchdog brought the window back two seconds later and the user
+            # could never get rid of it.
+            self.quitting = True
             event.accept()
+            QTimer.singleShot(0, QApplication.instance().quit)
             return
         event.ignore()
         self._state_before_hide = self.windowState()
@@ -712,12 +909,17 @@ class DshWindow(QMainWindow):
 
         This is the last safeguard against the invisible-process situation: if
         the tray disappears mid-session, the user does not lose the window.
+
+        The predicate must match `closeEvent`: `QSystemTrayIcon.isVisible()`
+        keeps returning True after `show()` even when the tray host has gone
+        away, so it cannot be used on its own — with it alone this watchdog was
+        unreachable and a crashed StatusNotifier host left a hidden window with
+        no icon and no menu to quit from.
         """
         if self.quitting:
             return
         tray = getattr(self, "_tray", None)
-        tray_visible = tray is not None and tray.isVisible()
-        if not self.isVisible() and not tray_visible:
+        if not self.isVisible() and not _tray_usable(tray):
             self._state_before_hide = None
             self.show_startup()
 
@@ -784,37 +986,49 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)  # required for the tray
 
     if "--selftest" in sys.argv:
-        DATA.mkdir(parents=True, exist_ok=True)
+        # A throwaway profile: the real one may belong to a running shell, and
+        # two QtWebEngine instances writing the same LevelDB/cache can corrupt it.
+        global DATA, LOCK, MARKER
+        DATA = Path(tempfile.mkdtemp(prefix="dsh-tray-selftest-"))
+        LOCK = DATA / ".lock"
+        MARKER = DATA / ".bootstrapped"
+        _prepare_data_dir()
         w = DshWindow()
         print(f"selftest: window={w.windowTitle()!r} tray_support="
               f"{QSystemTrayIcon.isSystemTrayAvailable()} target={target_url()}")
         QTimer.singleShot(2500, app.quit)
         return app.exec()
 
-    DATA.mkdir(parents=True, exist_ok=True)
+    _prepare_data_dir()
     lock = open(LOCK, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        sock = QLocalSocket()
-        sock.connectToServer(IPC_NAME)
-        if sock.waitForConnected(800):
-            if "--update" in sys.argv:
-                cmd = "update"
-            elif "--new-chat" in sys.argv:
-                cmd = "new-chat"
-            else:
-                cmd = "show"
-            sock.write(cmd.encode("utf-8"))
-            sock.waitForBytesWritten(800)
-            sock.disconnectFromServer()
+        # Another instance holds the lock: hand the request to it over IPC.
+        # --new-chat wins over --resume in the first instance, so the second
+        # instance applies the same rule (the old order was reversed here).
+        if "--update" in sys.argv:
+            cmd = "update"
+        elif "--new-chat" in sys.argv or (NEW_CHAT_DEFAULT and "--resume" not in sys.argv):
+            # DSH_NEW_CHAT=1 must work on a second launch too, not only via argv.
+            cmd = "new-chat"
         else:
-            print("dsh-tray: already running.", file=sys.stderr)
+            cmd = "show"
+        if not _ask_running_instance(cmd):
+            # Nothing on the other end: the socket may be stale, the instance may
+            # still be starting up, or the request may simply be a duplicate
+            # launch. Say so where the user can see it — a menu launch has no
+            # terminal, so stderr alone is invisible.
+            message = ("DSH Desktop is already running but did not accept the request "
+                       f"({cmd}). Bring it up from the tray icon.")
+            print(f"dsh-tray: {message}", file=sys.stderr)
+            _desktop_notify("DSH Desktop", message)
         return 0
 
     win = DshWindow()
 
-    tray = QSystemTrayIcon(QIcon(str(ICON)) if ICON.exists() else app.windowIcon())
+    tray_icon = _load_icon()
+    tray = QSystemTrayIcon(tray_icon if not tray_icon.isNull() else app.windowIcon())
     tray.setToolTip("DeepSeek Harness")
     menu = QMenu()
 
@@ -825,8 +1039,7 @@ def main() -> int:
     act_status = QAction("Service status", menu)
     act_status.triggered.connect(lambda: tray.showMessage(
         "dsh-web.service",
-        subprocess.run(["systemctl", "--user", "is-active", "dsh-web.service"],
-                       capture_output=True, text=True).stdout.strip() or "unknown",
+        _systemctl("is-active", "dsh-web.service").stdout.strip() or "unknown",
         QSystemTrayIcon.MessageIcon.Information, 3000,
     ))
 
@@ -851,13 +1064,22 @@ def main() -> int:
 
     # IPC Server for single-instance communication
     ipc_server = QLocalServer(win)
+    # Owner-only socket: the fallback path lives in a world-traversable /tmp, and
+    # any local process that can connect may ask the shell for "update"/"new-chat".
+    try:
+        ipc_server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    except AttributeError:  # older PyQt6 spelling
+        ipc_server.setSocketOptions(QLocalServer.UserAccessOption)
+    if os.path.exists(IPC_NAME) and not _socket_is_ours(IPC_NAME):
+        print(f"dsh-tray: {IPC_NAME} exists but is not this user's socket; "
+              "not trusting it.", file=sys.stderr)
     QLocalServer.removeServer(IPC_NAME)
     if ipc_server.listen(IPC_NAME):
         def handle_ipc() -> None:
             client = ipc_server.nextPendingConnection()
             if not client:
                 return
-            if client.waitForReadyRead(800):
+            if client.waitForReadyRead(300):
                 msg = bytes(client.readAll()).decode("utf-8").strip()
                 if msg == "update":
                     win._restore()
@@ -871,6 +1093,16 @@ def main() -> int:
 
         ipc_server.newConnection.connect(handle_ipc)
         win._ipc_server = ipc_server
+    else:
+        # Without a working socket a second launch cannot reach this window at
+        # all (the updater's "open the GUI" hand-off included). Never fail
+        # silently: the menu is the only place the user can see it.
+        ipc_error = (f"DSH Desktop could not open its IPC socket ({IPC_NAME}): "
+                     f"{ipc_server.errorString()}. A second launch will not reach "
+                     "this window.")
+        print(f"dsh-tray: {ipc_error}", file=sys.stderr)
+        tray.showMessage("DSH Desktop", ipc_error,
+                         QSystemTrayIcon.MessageIcon.Warning, 6000)
 
     def real_quit() -> None:
         """Really close the shell (the service keeps running).
@@ -920,8 +1152,7 @@ def main() -> int:
 
     def on_toggle_proxy() -> None:
         if is_proxy_active(force=True):
-            subprocess.run(["systemctl", "--user", "stop", PROXY_SERVICE],
-                           capture_output=True)
+            _systemctl("stop", PROXY_SERVICE)
             is_proxy_active(force=True)
             act_proxy.setChecked(False)
             act_copy_url.setEnabled(False)
@@ -933,13 +1164,14 @@ def main() -> int:
             )
         else:
             token, bind, port = ensure_proxy_config()
-            subprocess.run(["systemctl", "--user", "start", PROXY_SERVICE],
-                           capture_output=True)
+            # `restart` (not `start`): a changed proxy.env is only re-read when
+            # the unit is started again, and `start` is a no-op on a running unit.
+            _systemctl("restart", PROXY_SERVICE)
             active = is_proxy_active(force=True)
             act_proxy.setChecked(active)
             act_copy_url.setEnabled(active)
             if active:
-                url = f"http://{bind}:{port}/?token={token}"
+                url = build_remote_url(token, bind, port)
                 cb = QGuiApplication.clipboard()
                 if cb:
                     cb.setText(url)

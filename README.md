@@ -17,7 +17,7 @@ application on Linux:
 | **Desktop shortcut** | A launcher entry with icon — no terminal needed |
 | **Tray shell** | QtWebEngine window; closing it (X) hides to the tray instead of quitting |
 | **Tray menu** | Show/hide, reload, service status, in-app updates, Tailscale remote toggle & link copy, real quit |
-| **Session restore** | The shortcut reopens the last session; `DSH_NEW_CHAT=1` (or `--new-chat`) starts a clean prompt session with autofocus instead |
+| **Session restore** | The shortcut reopens the last session; `DSH_NEW_CHAT=1` (or `--new-chat`) starts a clean prompt session with autofocus instead. The clean-session switch needs the tray shell — the Chrome fallback window always resumes |
 | **systemd service** | `dsh-web.service` keeps DSH running independently of any window |
 | **Desktop notifications** | System notifications for turn, question, and error events |
 | **In-app updates** | One-click update check and apply directly from the GUI or notification, with live log stream and auto-reload |
@@ -96,6 +96,14 @@ Useful flags:
 | `--no-plugin` | Skip the notification plugin |
 | `--with-proxy` | Also enable the remote-access proxy (generates a token) |
 
+Every consumer resolves the same XDG variables the installer does
+(`XDG_BIN_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `DSH_HOME`), so a custom
+layout never splits the installation across two sets of paths. The installer
+prints an explicit reminder when a unit that is already running still holds the
+previously loaded code: `enable --now` cannot restart it, so run
+`systemctl --user restart dsh-web.service dsh-proxy.service` (restarting
+`dsh-web.service` ends any active agent turn).
+
 The installer copies files into XDG directories, fills the systemd unit
 templates with your real paths, enables the services, and links the notification
 plugin into your `web` profile — including installing the profile's dependency
@@ -167,7 +175,7 @@ network such as Tailscale.
 No manual terminal configuration is needed:
 1. Open the tray menu and check **Remote access (Tailscale)**.
 2. If `~/.config/dsh/proxy.env` does not exist yet, a secure 32-byte token is automatically generated and bound to your active Tailscale IP (`tailscale ip -4`).
-3. The ready-to-use URL (`http://<tailscale-ip>:3000/?token=...`) is automatically copied to your clipboard. On first visit, the proxy verifies the token, strips it from the upstream request, and issues a secure `Set-Cookie` (`dsh_proxy_token`) so subsequent requests, assets, and WebSocket streams persist seamlessly.
+3. The ready-to-use URL (`http://<tailscale-ip>:3000/?token=...`) is automatically copied to your clipboard. On first visit the proxy verifies that token, reads DSH's current launch token from the service journal, exchanges it with DSH **server-side**, and returns a `303` carrying both cookies (its own `dsh_proxy_token` and DSH's session cookie) — so a browser that has never seen DSH still lands on a logged-in page. The DSH launch token never reaches the browser and never appears in a URL you can copy. The proxy's own token is percent-encoded in the link, so a token containing `+` or `/` works.
 4. Click **Copy remote link** in the tray menu anytime you need the link on your phone or remote browser.
 5. Unchecking the option immediately stops `dsh-proxy.service` and returns DSH to loopback-only isolation.
 
@@ -186,8 +194,9 @@ Then visit `http://<tailscale-ip>:3000/?token=<your-token>`.
 
 ### Security and networking notes
 
-- **Authentication & session persistence:** Access requires the shared secret via `Bearer <token>`, `?token=<secret>`, or the `dsh_proxy_token` cookie. The proxy strips the token parameter before forwarding requests upstream to avoid collisions with DSH's internal `processLaunchToken`.
+- **Authentication & session persistence:** Access requires the shared secret via `Bearer <token>`, `?token=<secret>`, or the `dsh_proxy_token` cookie. The proxy strips the token parameter before forwarding requests upstream to avoid collisions with DSH's internal `processLaunchToken`, and it never forwards its own bearer token, cookie or a token-bearing `Referer` to DSH.
 - **Host normalization:** The proxy normalizes incoming `Host` headers to the upstream loopback address so DSH accepts the proxied connection without requiring manual `--trusted-host` adjustments, while preserving the original host in `X-Forwarded-Host`.
+- **Token in the URL:** the link the tray copies carries the *proxy* token in `?token=`; the proxy turns it into an HttpOnly `SameSite=Lax` cookie and strips it before forwarding upstream. The trade-off is that the token appears in the browser history and the clipboard — treat the copied link like a password. (Tailscale itself is WireGuard-encrypted, so the token is not exposed to the local network.) If the browser cannot be logged in automatically (for example the service was restarted and the journal no longer holds the launch token), the proxy falls back to forwarding the request, and DSH shows its own "authentication required" page.
 - **Client safety:** The proxy deliberately does **not** inject `window.__DSH_TRANSPORT__ = { ownsHost: true }` — that upstream flag tells the DSH client it is running on the host machine, which would grant remote browsers the host's settings-write path.
 
 ---
@@ -197,6 +206,9 @@ Then visit `http://<tailscale-ip>:3000/?token=<your-token>`.
 ```
 bin/            scripts installed to ~/.local/bin
 bin/dsh-yaml-check.py   profile patch validator used by both installers (not installed)
+bin/dsh-launcher.sh     standalone CLI launcher (dsh web in a terminal; not wired
+                        into any unit or desktop entry — the shortcuts use
+                        dsh-desktop-launch.sh)
 units/          systemd user unit templates (filled in by install.sh)
 applications/   .desktop entries
 icons/          app icon (png + svg + hicolor sizes)
@@ -209,7 +221,7 @@ Installed locations:
 
 | From | To |
 |---|---|
-| `bin/*` | `~/.local/bin/` |
+| `bin/*` (except `dsh-yaml-check.py`) | `~/.local/bin/` (`$XDG_BIN_HOME` when set) |
 | `units/*` | `~/.config/systemd/user/` |
 | `applications/*` | `~/.local/share/applications/` |
 | `icons/*` | `~/.local/share/icons/` |
@@ -234,6 +246,11 @@ All scripts read environment variables; nothing hardcodes a username.
 | `DSH_PROXY_TOKEN` | proxy | empty → loopback only |
 | `DSH_PROXY_BIND` | proxy | `127.0.0.1` |
 | `DSH_PROXY_PORT` | proxy | `3000` |
+| `DSH_PROXY_UPSTREAM_TIMEOUT_MS` | proxy | `30000` (response **headers** only; streams are never cut off) |
+| `DSH_UPDATE_BUN_TIMEOUT` | updater | `900` seconds for `bun add`/`bun install` |
+| `XDG_BIN_HOME` | installer, launcher, tray, updater | `~/.local/bin` |
+| `XDG_DATA_HOME` | installer, tray, updater | `~/.local/share` |
+| `XDG_CONFIG_HOME` | installer, tray, updater (proxy.env, units) | `~/.config` |
 
 To change the window mode, edit `DSH_TRAY_WINDOW` in
 `~/.local/bin/dsh-desktop-launch.sh`.
@@ -267,7 +284,7 @@ desktop, then keeps working: the window simply closes instead of hiding.
 | Concern | How it is handled |
 |---|---|
 | **Tray availability** | Probed with `QSystemTrayIcon.isSystemTrayAvailable()` plus a live-tray check; a watchdog restores the window if the tray vanishes mid-session |
-| **Notification delivery** | The session bus is *discovered* (`DBUS_SESSION_BUS_ADDRESS`, then `$XDG_RUNTIME_DIR/bus`, then `/run/user/<uid>/bus`) instead of assumed; a failure reports the exact reason |
+| **Notification delivery** | `dsh-update notify` *discovers* the session bus (`DBUS_SESSION_BUS_ADDRESS`, then `$XDG_RUNTIME_DIR/bus`, then `/run/user/<uid>/bus`) instead of assuming it; a failure reports the exact reason. The update-check unit exports `XDG_RUNTIME_DIR=%t` only — the script derives the bus address from it. `dsh-web.service` is the unit that pins `DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` |
 | **Service startup** | Units bind to `default.target`/`timers.target`, which exist on every systemd install. `graphical-session.target` is deliberately avoided because XFCE/MATE/Cinnamon sessions do not always pull it in, which would leave the timer permanently inactive |
 | **Desktop shortcut location** | Resolved via `xdg-user-dir DESKTOP`, falling back to `~/Desktop` |
 | **Menu / icon caches** | `update-desktop-database` and `gtk-update-icon-cache` are called only when present |
@@ -310,6 +327,14 @@ instead of failing silently.
 2. Confirm the plugin loaded: `dsh --profile web --dump-config | grep notify`
 3. Restart DSH after installing the plugin — the client roster is built at boot.
 4. Subagent-only activity does not notify by default (`includeSubagents`).
+
+**Notifications never appear, although the switches are on**
+
+The row says "Notifications are blocked by the browser" when the OS/browser
+permission was denied. Allow notifications for the page (QtWebEngine and Chrome
+each keep their own permission store), then reload. The permission is requested
+when you interact with any switch in the row; the request made at attach time has
+no user gesture and is usually denied.
 
 **The Notifications row is missing from the General settings page**
 The client bundle is fetched when the page loads, so reload the interface first —

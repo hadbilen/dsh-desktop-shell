@@ -70,4 +70,10 @@ DSH_ENTRY="$(find_dsh)" || {
   exit 1
 }
 
-exec "$NODE" "$DSH_ENTRY" web "$@"
+# `dsh` on PATH may be a wrapper script rather than the JS entry point (a distro
+# package or a shim), and handing a shell script to node is a SyntaxError. Only a
+# real JS file goes to node; anything else is executed directly.
+case "$DSH_ENTRY" in
+  *.js|*.mjs|*.cjs) exec "$NODE" "$DSH_ENTRY" web "$@" ;;
+  *)                exec "$DSH_ENTRY" web "$@" ;;
+esac

@@ -58,19 +58,56 @@ def check_with_pyyaml(text: str) -> bool | None:
     DshPatchLoader.add_multi_constructor("tag:yaml.org,2002:", _unknown_tag)
 
     try:
-        yaml.load(text, Loader=DshPatchLoader)
-        return True
+        data = yaml.load(text, Loader=DshPatchLoader)
     except Exception as e:  # noqa: BLE001 - any parser error means "broken"
         print(f"yaml: {e}", file=sys.stderr)
         return False
+    # A patch is an entry LIST (DSH's own template is `[]`). A mapping root parses
+    # fine but cannot accept the `- insert:` block, so DSH would fail on it.
+    if data is not None and not isinstance(data, list):
+        print(f"patch root is {type(data).__name__}, expected a list of entries",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def strip_comment(line: str) -> str:
+    """Drop a trailing YAML comment, ignoring `#` inside quotes.
+
+    Without this, a perfectly valid line such as `sound: true   # don't play`
+    was reported as "unterminated quote" (the apostrophe inside the comment
+    opened a string), and the caller rolled back a good installation.
+
+    @param line - one source line.
+    @returns the line up to (not including) an unquoted comment.
+    """
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index]
+        index += 1
+    return line
 
 
 def check_structure(text: str) -> bool:
-    """Conservative check for the two failures that matter for a patch file.
+    """Conservative check for the failures that matter for a patch file.
 
     A profile patch is an entry LIST (DSH's own template is `[]`), so:
-      - a tab in the indentation is invalid YAML, and
-      - a mapping root cannot accept the `- insert:` block this project adds.
+      - a tab in the indentation is invalid YAML,
+      - a mapping root cannot accept the `- insert:` block this project adds,
+      - and unbalanced brackets/quotes are the usual shape of a truncated edit.
+
+    This runs only when PyYAML is absent; it is a smoke check, not a parser.
 
     @param text - the file contents.
     @returns True when nothing indicates corruption.
@@ -81,13 +118,47 @@ def check_structure(text: str) -> bool:
         if "\t" in indent:
             print(f"line {number}: tab in indentation", file=sys.stderr)
             return False
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped == "[]":
+
+    # The root must be a sequence: the first content line is a `- ` item.
+    # `---`/`...` document markers and comments are not content.
+    for number, line in enumerate(lines, 1):
+        stripped = strip_comment(line).strip()
+        if not stripped or stripped in ("---", "...") or stripped == "[]":
             continue
-        if stripped.startswith("- "):
-            return True
-        print(f"patch root is not a sequence: {stripped[:60]!r}", file=sys.stderr)
+        if not stripped.startswith("- ") and stripped != "-":
+            print(f"line {number}: patch root is not a sequence: {stripped[:60]!r}",
+                  file=sys.stderr)
+            return False
+        break
+
+    # Unbalanced brackets/quotes are the other shape a broken patch takes. Quotes
+    # are tracked so `[` inside a string (a JS expression in a `!!js` tag, say)
+    # does not count.
+    depth = 0
+    quote = ""
+    for number, line in enumerate(lines, 1):
+        code = strip_comment(line)
+        index = 0
+        while index < len(code):
+            char = code[index]
+            if quote:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth < 0:
+                    print(f"line {number}: unbalanced closing bracket", file=sys.stderr)
+                    return False
+            index += 1
+    if depth != 0 or quote:
+        print("unbalanced brackets or an unterminated quote", file=sys.stderr)
         return False
     return True
 

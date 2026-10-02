@@ -53,6 +53,24 @@ run() {
 latest_backup() {
   ls -t "$1".bak.* 2>/dev/null | head -n1 || true
 }
+# Does the patch already carry the dsh-notify entry? The match is EXACT: a plain
+# `grep "id: notify"` also matches unrelated entries such as `- id: notify-slack`
+# and would then skip the entry while still reporting success. uninstall.sh uses
+# the same rule.
+patch_has_notify() {
+  grep -qE "^[[:space:]]*-[[:space:]]*id:[[:space:]]*['\"]?notify['\"]?[[:space:]]*$" "$1"
+}
+# The insert block, taken from the plugin's own template so there is exactly one
+# source of truth for it (the fallback keeps the installer working if the file
+# was removed).
+notify_patch_entry() {
+  if [ -f "$REPO_DIR/notify/cordis.patch.yml" ]; then
+    cat "$REPO_DIR/notify/cordis.patch.yml"
+  else
+    printf -- "# dsh-notify - reply completion / question / error notifications\n"
+    printf -- "- insert:\n    - id: notify\n      name: 'dsh-notify'\n"
+  fi
+}
 # Validate a profile patch. 0 = valid (or no validator available), 1 = broken.
 # A patch that does not parse is fatal for the whole profile, so both editors
 # check their own work with the same implementation.
@@ -95,6 +113,18 @@ if [ -z "$NODE" ]; then
   exit 1
 fi
 say "node        : $NODE"
+# A node that lives inside another application's cache can disappear when that
+# application updates or prunes it, and dsh-web.service would then never start.
+NODE_REAL="$(readlink -f "$NODE" 2>/dev/null || printf '%s' "$NODE")"
+case "$NODE_REAL" in
+  */.cache/*|*/cache/*|*/codex-runtimes/*)
+    say "! node resolves into a cache directory:"
+    say "    $NODE -> $NODE_REAL"
+    say "  The owning application may replace or prune it, which would leave"
+    say "  dsh-web.service unable to start. Prefer a system Node"
+    say "  (sudo apt install nodejs, or nvm/fnm) or set DSH_NODE to a stable path."
+    ;;
+esac
 
 # An explicit setting (DSH_BIN) always wins over auto-detection: the user knows
 # which installation to use, a heuristic search does not. That is why the
@@ -246,10 +276,13 @@ if [ "$WITH_SERVICES" = 1 ]; then
     if [ "$DRY_RUN" = 1 ]; then
       say "[dry-run] $unit (template will be rendered)"
     else
+      # __PROXY_ENV__ is rendered too: the unit must read exactly the file this
+      # script writes, and that path follows XDG_CONFIG_HOME.
       sed -e "s|__NODE__|$NODE|g" \
           -e "s|__DSH_BIN__|$DSH_BIN|g" \
           -e "s|__PYTHON__|$PYTHON|g" \
           -e "s|__BIN_DIR__|$BIN_DIR|g" \
+          -e "s|__PROXY_ENV__|$CONF_DIR/dsh/proxy.env|g" \
           -e "s|@BIN_DIR@|$BIN_DIR|g" \
           "$REPO_DIR/units/$unit" > "$UNIT_DIR/$unit"
       chmod 0644 "$UNIT_DIR/$unit"
@@ -268,10 +301,29 @@ if [ "$WITH_SERVICES" = 1 ]; then
       && say "dsh-update-check.timer enabled" \
       || say "! could not enable the timer"
 
+    # `enable --now` is a no-op on an already-running unit, so a service that was
+    # up keeps the code it loaded at start. Say so instead of pretending the new
+    # scripts are live.
+    RUNNING_UNITS=""
+    for u in dsh-web.service dsh-proxy.service; do
+      if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+        RUNNING_UNITS="$RUNNING_UNITS $u"
+      fi
+    done
+    if [ -n "$RUNNING_UNITS" ]; then
+      say "note        : these units are already running the previously loaded code:"
+      say "             $RUNNING_UNITS"
+      say "              Restart them to pick up this install:"
+      say "                systemctl --user restart dsh-web.service dsh-proxy.service"
+      say "              (Restarting dsh-web.service ends any active agent turn.)"
+    fi
+
     if [ "$WITH_PROXY" = 1 ]; then
       mkdir -p "$CONF_DIR/dsh"
       if [ ! -f "$CONF_DIR/dsh/proxy.env" ]; then
-        TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+        # URL-safe alphabet and no padding: a token containing `+` or `/` breaks
+        # a `?token=` link (URLSearchParams decodes `+` as a space).
+        TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_')"
         printf 'DSH_PROXY_TOKEN=%s\n' "$TOKEN" > "$CONF_DIR/dsh/proxy.env"
         chmod 0600 "$CONF_DIR/dsh/proxy.env"
         say "proxy token generated: $CONF_DIR/dsh/proxy.env"
@@ -405,35 +457,44 @@ PY
       # ("could not find expected ':'"). So the empty root is dropped.
       PATCH="$PROFILE_DIR/cordis.patch.yml"
       if [ ! -f "$PATCH" ]; then
-        if [ "$DRY_RUN" = 1 ]; then
-          say "[dry-run] cordis.patch.yml would be created with dsh-notify"
-        else
-          # Created atomically and mode 0600: the patch can carry secrets (API
-          # keys, tokens) and the profile's own patch is 0600, so a new one must
-          # not be world-readable.
-          PATCH_TMP="$(mktemp "$PROFILE_DIR/.cordis.patch.XXXXXX")"
-          printf -- "# dsh-notify - reply completion / question / error notifications\n- insert:\n    - id: notify\n      name: 'dsh-notify'\n" > "$PATCH_TMP"
-          chmod 0600 "$PATCH_TMP"
-          mv -f "$PATCH_TMP" "$PATCH"
-          say "cordis.patch.yml created with dsh-notify"
+        # Created atomically and mode 0600: the patch can carry secrets (API
+        # keys, tokens) and the profile's own patch is 0600, so a new one must
+        # not be world-readable. (No dry-run test here: this whole block already
+        # runs inside the non-dry-run branch, so one would be dead code.)
+        PATCH_TMP="$(mktemp "$PROFILE_DIR/.cordis.patch.XXXXXX")"
+        notify_patch_entry > "$PATCH_TMP"
+        chmod 0600 "$PATCH_TMP"
+        mv -f "$PATCH_TMP" "$PATCH"
+        say "cordis.patch.yml created with dsh-notify"
+        # Validate even a freshly written patch: a broken patch is fatal for the
+        # whole profile, and "we just wrote it" is not a proof that it parses.
+        if ! patch_is_valid "$PATCH"; then
+          rm -f "$PATCH"
+          remove_plugin_from_manifest
+          say "! the generated cordis.patch.yml did not validate; removed it and rolled back package.json"
+          PLUGIN_DEPS_OK=0
         fi
-      elif ! grep -q "id: notify" "$PATCH"; then
+      elif ! patch_has_notify "$PATCH"; then
         cp -p "$PATCH" "$PATCH.bak.$(date +%Y%m%d-%H%M%S)"
         # The rewrite is atomic (temp file + os.replace) and keeps the original
         # mode: an interrupted write used to be able to truncate the profile
         # patch, which is fatal for the whole profile.
-        "$PYTHON" - "$PATCH" <<'PY'
+        # The entry text comes from notify/cordis.patch.yml (one source of truth),
+        # passed as argv[2] so the snippet does not hardcode it a second time.
+        "$PYTHON" - "$PATCH" "$(notify_patch_entry)" <<'PY'
 import os, sys, tempfile
 p = sys.argv[1]
-with open(p, encoding="utf-8") as f:
-    lines = [ln for ln in f.read().splitlines() if ln.strip() != "[]"]
-body = "\n".join(lines).strip()
-entry = (
+entry = sys.argv[2] if len(sys.argv) > 2 else (
     "# dsh-notify - reply completion / question / error notifications\n"
     "- insert:\n"
     "    - id: notify\n"
     "      name: 'dsh-notify'\n"
 )
+if not entry.endswith("\n"):
+    entry += "\n"
+with open(p, encoding="utf-8") as f:
+    lines = [ln for ln in f.read().splitlines() if ln.strip() != "[]"]
+body = "\n".join(lines).strip()
 new_text = entry + ("\n" + body + "\n" if body else "")
 mode = os.stat(p).st_mode & 0o777
 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(p), delete=False,
@@ -468,6 +529,12 @@ PY
           remove_plugin_from_manifest
           LATEST_BAK="$(latest_backup "$PATCH")"
           [ -n "$LATEST_BAK" ] && cp -p "$LATEST_BAK" "$PATCH"
+          # uninstall.sh already removed this link; leaving it behind means a
+          # dangling symlink once the plugin directory is gone.
+          if [ -L "$PROFILE_DIR/node_modules/dsh-notify" ]; then
+            rm -f "$PROFILE_DIR/node_modules/dsh-notify"
+            say "  profile link removed: $PROFILE_DIR/node_modules/dsh-notify"
+          fi
           say "  Profile restored. Check: cd $PLUGIN_DIR && pnpm install"
         fi
       fi

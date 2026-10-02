@@ -11,7 +11,14 @@ Type=simple
 # Remote access is enabled ONLY when DSH_PROXY_TOKEN is set. Without a token
 # the proxy binds to loopback and serves nothing externally (the safe default).
 # To generate a token: head -c 32 /dev/urandom | base64
-EnvironmentFile=-%h/.config/dsh/proxy.env
+# NOTE: values from an EnvironmentFile OVERRIDE Environment= (systemd.exec(5):
+# "Settings from these files override settings made with Environment="), so the
+# bind address below is only the DEFAULT and proxy.env wins when it sets one.
+# Do not "fix" this by reordering the lines: order does not matter.
+#
+# __PROXY_ENV__ is rendered by install.sh so the unit reads exactly the file the
+# installer wrote, wherever XDG_CONFIG_HOME points.
+EnvironmentFile=-__PROXY_ENV__
 # To bind to the Tailscale interface: DSH_PROXY_BIND=<tailscale ip -4>
 Environment=DSH_PROXY_BIND=127.0.0.1
 Environment=DSH_PROXY_PORT=3000
@@ -19,6 +26,11 @@ Environment=DSH_WEB_URL=http://127.0.0.1:3080
 ExecStart=__NODE__ __BIN_DIR__/dsh-tailscale-proxy.mjs
 Restart=always
 RestartSec=3
+# This process is a plain HTTP proxy: it needs no privileges and no shared /tmp.
+# (dsh-web.service is deliberately left unhardened: it runs agent shell commands
+# in bubblewrap sandboxes, which may need user namespaces.)
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=default.target

@@ -1,5 +1,133 @@
 # Changelog
 
+## 0.0.6 - 2026-10-03
+
+Fixes for a third-party audit and subsequent end-to-end hardening of this repository
+(source review, security audit, and live-installation verification). Every finding was
+verified against the code before action was taken. The audit's five incorrect findings
+(CSWSH on the proxy upgrade — the handler authenticates, systemd `Environment=`
+precedence — the man page says the opposite, the plugin "missing" dependencies — pnpm
+auto-installs the declared peers, the WebSocket header concatenation — Node rejects CR/LF
+in header values, and the two bootstrap marker names — different components, different
+directories) were checked and deliberately left alone.
+
+### Fixed — remote-access proxy (`bin/dsh-tailscale-proxy.mjs`)
+- **Unauthenticated crash (DoS).** `getCookie` called `decodeURIComponent` on a
+  client-supplied cookie *before* authentication and without a `try`. A single
+  request with `Cookie: dsh_proxy_token=%` raised an uncaught `URIError`, killed
+  the process, and `Restart=always` turned it into a three-second crash loop.
+  Malformed escapes now yield "no cookie".
+- **Remote access could never log a browser in.** DSH authenticates the browser
+  separately (`dsh web` prints a one-shot launch token that mints an
+  authority-bound cookie), and the proxy stripped every `?token=` before
+  forwarding — so a first-time remote browser was permanently stuck on DSH's 401
+  page. The proxy now performs the exchange itself: it reads the current launch
+  token from the service journal, exchanges it with DSH, and answers the
+  authenticated bootstrap request with a `303` carrying DSH's session cookie
+  plus its own. The launch token never reaches the browser.
+- **The proxy's own credentials are no longer forwarded upstream**
+  (`Authorization`, the `dsh_proxy_token` cookie, and a `Referer` that carried
+  the token are stripped).
+- **Upstream response-header timeout** (default 30 s, `DSH_PROXY_UPSTREAM_TIMEOUT_MS`):
+  a hung upstream now yields `504` instead of hanging the browser forever. It is
+  a headers-only timer, so a quiet SSE stream is never cut off.
+- **Tokens containing `+`, `/` or `=` work.** `install.sh` generated the token
+  with plain `base64` (~50% contain `+`), while the link was built unencoded and
+  `URLSearchParams` decodes `+` as a space. Tokens are now URL-safe, the link is
+  percent-encoded, and the proxy also compares the raw query value.
+- **Error handlers for listen & upstream streams.** `server.listen` failures print a
+  clear EADDRINUSE message instead of a three-second restart loop, and an upstream
+  response stream error no longer crashes the process.
+- **Readable 503 and security headers.** Serves the readable 503 page when DSH is
+  down (ECONNREFUSED) instead of a bare 502 line, and adds `X-Frame-Options: SAMEORIGIN`
+  and `X-Content-Type-Options: nosniff` to every response.
+- **Crypto fallback.** The `randomUUID` polyfill throws instead of falling back to
+  `Math.random`.
+
+### Fixed — updater (`bin/dsh-update.py`)
+- **`full` and `extras --remove` delete only download artifacts.** The narrowed archive
+  scope of v0.0.6 is shared across both paths (`_deletable_archive`), protecting project
+  directories and home files from unintended deletion.
+- **Exception and signal safety during the destructive window.** Catches `BaseException`,
+  installs signal guards, and safely restores the tree, `package.json`, `bun.lock` and
+  service through a shared `_rollback()`.
+- **Existing `tree-backup` preservation.** Stale backups are preserved as
+  `tree-backup.<stamp>` instead of being overwritten during interrupted runs.
+- **Exit codes & check honesty.** Exit code `2` ("installed, leftovers remain") is
+  returned honestly, usage errors return `1`, and failed final checks are not swallowed.
+- **Timeouts.** Timeouts added for `bun add`/`bun install` (`DSH_UPDATE_BUN_TIMEOUT`,
+  default 900 s) and `systemctl`.
+- **Silent downgrade prevention.** Prompts for `--allow-downgrade` if the installed
+  version is newer than available npm versions.
+- **True cache pruning.** Stale `name@ver@@@n` directories are deleted along with their
+  symlinks; version child directories are no longer mistaken for version entries.
+- **Dependency version tolerance.** Only core `dsh` package copies count as removable
+  leftovers; differing `dsh-*` dependencies are reported for information only.
+- **Symlink safety & process cleanup.** `rmtree_verified` handles symlinks without
+  recursing targets; run logs are properly closed and descriptors restored.
+- **Locking & path parity.** The timer's `notify` run acquires the lock; XDG paths match
+  `install.sh` exactly.
+
+### Fixed — tray and launchers (`bin/dsh-tray.py`, `bin/dsh-app-window.sh`, `bin/dsh-desktop-launch.sh`)
+- **Tray-less session quit.** Window close terminates the shell cleanly when no tray host
+  is present instead of leaving a phantom process resurrecting the window.
+- **Watchdog & fallback icon.** Detects lost system tray hosts reliably; falls back to
+  themed icons when installed assets are missing.
+- **Owner-only IPC socket.** Created with `QLocalServer.UserAccessOption` (0600); reports
+  connection failures via desktop notifications rather than hidden stderrs.
+- **Connection retry.** "Retry Connection" on the error page re-executes service probe
+  and token exchange instead of hitting 401s; preserves one-shot `--new-chat` latches.
+- **`DSH_NEW_CHAT=1` on second launch.** Honored over IPC on subsequent invocations.
+- **XDG path compliance.** Scripts honor `XDG_BIN_HOME`, `XDG_DATA_HOME`, and
+  `XDG_CONFIG_HOME`; data directory permissions set to `0700`.
+- **Chrome argument cleanup.** Spurious empty argument eliminated from Chrome fallback
+  launcher; missing token or curl commands raise explicit notifications.
+- **Process management.** Timeouts on blocking calls; update dialogs and `QProcess`
+  instances freed properly.
+
+### Fixed — notification plugin (`notify/`)
+- **Runtime settings reactivity.** `ConfigForm.subscribe` listener pulls snapshot via
+  `form.getSnapshot()`, preventing silent resets to defaults on configuration updates.
+- **Optional inject for sessions.** Adopts `sessions` service via optional injection
+  without throwing when unserved.
+- **Reachable browser permission prompt.** OS notification permissions requested on any
+  switch interaction; blocked states surfaced clearly in the UI.
+- **Resource cleanup.** Row stylesheet disposed on unload; per-session maps pruned on
+  session removal; debounce keyed by session and event kind.
+- **Store resilience.** Settings row survives missing snapshot store (`props.useNotice`
+  guard).
+
+### Fixed — installer, uninstaller and units (`install.sh`, `uninstall.sh`, `units/`, `bin/dsh-yaml-check.py`)
+- **Exact-match notification removal.** Replaced greedy prefix matching to avoid
+  accidentally unlinking unrelated plugins like `- id: notify-slack`.
+- **URL-safe proxy tokens.** Tokens generated without `+` or `/`; unit `EnvironmentFile`
+  path rendered to match `XDG_CONFIG_HOME`.
+- **Single source of truth for cordis patch.** Unified via `notify/cordis.patch.yml`;
+  validates fresh patches and cleans profile `node_modules` symlinks on rollback.
+- **Node cache warnings.** Warns when resolved node binary points into temporary or
+  application-specific cache directories.
+- **Active unit reminder.** Explicitly lists running units requiring restart after
+  installation.
+- **Systemd timer ordering.** Eliminated boot ordering cycles in
+  `units/dsh-update-check.timer`.
+- **Unit sandbox hardening.** Added `NoNewPrivileges=yes` and `PrivateTmp=yes` to
+  `units/dsh-proxy.service`.
+- **YAML check resilience.** Validates tabs, root sequences, balanced quotes/brackets,
+  and handles `!!js` tags gracefully.
+
+### Documentation
+- README: documented XDG environment variables, proxy server-side token exchange and
+  trade-offs, standalone CLI launcher, and notification troubleshooting steps.
+- Unit documentation: documented `EnvironmentFile` precedence rules.
+
+### Verified
+- Automated and end-to-end tests:
+  - Proxy credential stripping, timeout handling, URL-safe token parsing, and 503 error handling.
+  - Updater rollback atomicity, signal handling, backup preservation, and cache pruning.
+  - Notification plugin snapshot synchronization, permission workflow, and session filtering.
+  - Heredoc snippets in `install.sh` and `uninstall.sh` against corrupted and empty fixtures.
+  - Headless UI validation of notification rows and settings controls.
+
 ## 0.0.5 - 2026-10-02
 
 Everything below landed between v0.0.4 and this release: update-path hardening, an

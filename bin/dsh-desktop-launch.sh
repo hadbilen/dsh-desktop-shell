@@ -11,12 +11,14 @@
 # Configurable:
 #   DSH_TRAY_WINDOW   maximized (default) | fullscreen | normal
 #   DSH_NEW_CHAT      0 (default: restore the last session) | 1 (start a new chat)
-#   DSH_BIN_DIR       directory holding the scripts (default ~/.local/bin)
+#   DSH_BIN_DIR       directory holding the scripts (default: XDG_BIN_HOME or ~/.local/bin)
 #   DSH_PYTHON        python3 interpreter to use
 
 set -u
 
-BIN_DIR="${DSH_BIN_DIR:-$HOME/.local/bin}"
+# Must resolve exactly like install.sh, otherwise a custom XDG_BIN_HOME makes the
+# desktop entry point at scripts that do not exist (silently: Terminal=false).
+BIN_DIR="${DSH_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 TRAY="$BIN_DIR/dsh-tray.py"
 CHROME="$BIN_DIR/dsh-app-window.sh"
 
@@ -32,6 +34,16 @@ export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:+$QTWEBENGINE_CH
 # Probe PyQt6 WebEngine with the interpreter we would actually use; report the
 # reason instead of swallowing it.
 PY="${DSH_PYTHON:-$(command -v python3 || true)}"
+if [ ! -x "$TRAY" ] && [ ! -x "$CHROME" ]; then
+  # A menu launch shows nothing, so say it where the user will look.
+  printf 'dsh: no shell scripts found in %s\n' "$BIN_DIR" >&2
+  printf '     Set DSH_BIN_DIR, or re-run install.sh.\n' >&2
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a DSH -u critical "DSH Desktop: scripts not found" \
+      "Neither $TRAY nor $CHROME exists. Re-run install.sh." 2>/dev/null || true
+  fi
+  exit 1
+fi
 if [ -n "$PY" ] && [ -x "$TRAY" ]; then
   if probe_err=$("$PY" -c 'from PyQt6.QtWebEngineWidgets import QWebEngineView' 2>&1); then
     exec "$PY" "$TRAY" "$@"
@@ -42,6 +54,16 @@ if [ -n "$PY" ] && [ -x "$TRAY" ]; then
     printf '     Reason: %s\n' "$(printf '%s' "$probe_err" | head -n 1)" >&2
     printf '     Install: sudo apt install python3-pyqt6.qtwebengine\n' >&2
   fi
+fi
+
+if [ ! -x "$CHROME" ]; then
+  printf 'dsh: the Chrome fallback is missing: %s\n' "$CHROME" >&2
+  printf '     Re-run install.sh, or set DSH_BIN_DIR to the directory holding the scripts.\n' >&2
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a DSH -u critical "DSH Desktop: fallback missing" \
+      "$CHROME does not exist. Re-run install.sh." 2>/dev/null || true
+  fi
+  exit 1
 fi
 
 exec "$CHROME" "$@"
