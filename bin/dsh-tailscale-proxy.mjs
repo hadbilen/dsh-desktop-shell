@@ -16,9 +16,9 @@
  *     that upstream deliberately disables becomes available. Remote clients
  *     are NOT given that authority.
  *
- *  2. `Host` header is normalized to loopback (${TARGET_HOST}:${targetPort}) so upstream
+ *  2. `Host` and `Origin` headers are normalized to loopback (${TARGET_HOST}:${targetPort}) so upstream
  *     DSH accepts reverse-proxied requests behind authentication, preserving the
- *     client's host in `X-Forwarded-Host`. Origin and Sec-Fetch-Site are not modified.
+ *     client's host in `X-Forwarded-Host`. Sec-Fetch-Site is not modified.
  *
  *  3. The proxy REQUIRES authentication. When the `DSH_PROXY_TOKEN` environment
  *     variable is set, every request must carry `Authorization: Bearer <token>`
@@ -535,6 +535,10 @@ function buildUpstreamHeaders(req, targetPort) {
   }
   headers['host'] = `${TARGET_HOST}:${targetPort}`;
 
+  if (headers['origin']) {
+    headers['origin'] = `http://${TARGET_HOST}:${targetPort}`;
+  }
+
   if (headers['authorization']) {
     const m = /^Bearer\s+(.+)$/i.exec(String(headers['authorization']));
     if (m && safeEqual(m[1].trim(), PROXY_TOKEN)) delete headers['authorization'];
@@ -559,7 +563,7 @@ function buildUpstreamHeaders(req, targetPort) {
  * @param {boolean} setCookie - attach the proxy cookie to the response.
  */
 function forward(req, res, targetPort, setCookie) {
-  // 2) Headers: Normalize Host header to loopback so upstream DSH accepts the
+  // 2) Headers: Normalize Host and Origin headers to loopback so upstream DSH accepts the
   //    reverse-proxied request behind the authentication layer, and preserve original
   //    host in X-Forwarded-Host.
   const headers = buildUpstreamHeaders(req, targetPort);

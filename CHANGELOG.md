@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.7 - 2026-10-06
+
+Origin header normalization for reverse-proxied connections and WebSocket upgrades.
+
+### Fixed — remote-access proxy (`bin/dsh-tailscale-proxy.mjs`)
+- **Origin header normalization for reverse-proxied requests & WebSocket upgrades.** When DSH is
+  accessed via a reverse proxy (e.g. over Tailscale), incoming `Origin` headers from remote
+  clients caused upstream origin checks and CORS validation failures. `Origin` headers are now
+  normalized to the upstream loopback address (`http://${TARGET_HOST}:${targetPort}`) alongside
+  `Host`, allowing authenticated HTTP requests and WebSocket connections to succeed seamlessly.
+
 ## 0.0.6 - 2026-10-03
 
 Fixes for a third-party audit and subsequent end-to-end hardening of this repository
